@@ -1,0 +1,1475 @@
+#+title: Lesson 06 — Structured Output
+#+subtitle: Replacing prose with JSON for deterministic grading
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Lessons 03–05 graded agents by parsing prose.  The =agent_summary.txt= file
+was free-form English, and the grader used keyword matching — scanning for
+words like "best", "lowest", "failure" co-occurring with model names.  This
+worked, but:
+
+1. *Non-deterministic*.  An agent saying "Calibrated is the top performer"
+   passes, but "Calibrated achieves the most accurate predictions" might
+   fail — same semantics, different keywords.
+
+2. *Fragile across LLMs*.  Haiku phrases things differently from Sonnet.
+   Every new model risks false negatives in the grader.
+
+3. *Opaque*.  When grading fails, it's unclear /why/ — the keyword sets are
+   buried in =_POSITIVE_WORDS= / =_NEGATIVE_WORDS= and require maintenance.
+
+The fix: define a JSON schema for agent verdicts.  The agent writes a
+structured =agent_verdict.json= instead of prose.  The grader reads fields
+directly — no NLP, no guessing, no maintenance.
+
+#+begin_example
+Before (Lesson 05):                    After (Lesson 06):
+
+agent_summary.txt                      agent_verdict.json
+───────────────────                    ──────────────────────
+"The CalibratedModel                   {
+ demonstrates superior                   "best_model": "CalibratedModel",
+ performance as the                      "best_reason": "lowest RMSE ...",
+ best model..."                          "worst_model": "LinearModel",
+                                         "worst_reason": "fails to capture ...",
+       ↓                                 "reference_model": "LinearModel",
+  keyword scan                            "summary": "The CalibratedModel..."
+  (fragile)                              }
+                                                ↓
+                                          field lookup
+                                          (deterministic)
+#+end_example
+
+This lesson builds:
+
+- *=AgentVerdict=* — the JSON schema as a dataclass
+- *Updated briefs* — step 4 now asks agents to write =agent_verdict.json=
+- *Updated graders* — read JSON fields directly, fall back to prose
+- *Updated simulated agent* — writes structured JSON
+- *Updated LLM runner* — system prompt asks for JSON output
+
+** File Map
+
+| File                                 | Change                                      |
+|--------------------------------------+---------------------------------------------|
+| =src/dmt/agent/verdict.py=          | NEW: AgentVerdict dataclass + JSON I/O       |
+| =src/dmt/agent/brief.py=            | Updated steps + constraints for JSON output  |
+| =src/dmt/agent/grader.py=           | Rewritten: JSON-first, prose fallback        |
+| =src/dmt/agent/llm_runner.py=       | Updated system prompt for JSON output        |
+| =scripts/simulated_agent.py=        | Updated to write agent_verdict.json          |
+| =test/test_structured_output.py=    | Tests for verdict schema + grading           |
+
+
+* The Agent Verdict Schema
+
+The schema is deliberately flat.  Every field the grader needs is a top-level
+key.  Domain-specific fields go in =extra= — the schema itself stays universal.
+
+#+begin_src python :tangle ../src/dmt/agent/verdict.py
+"""Structured agent verdict — the JSON output schema.
+
+Instead of prose summaries, agents write a JSON file with explicit fields.
+The grader checks field values directly — no keyword matching.
+"""
+
+import json
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+
+VERDICT_FILENAME = "agent_verdict.json"
+
+
+@dataclass
+class AgentVerdict:
+    """Structured verdict from an agent run.
+
+    Fields
+    ------
+    best_model : str
+        Name of the model the agent considers best.
+    best_reason : str
+        One-sentence justification.
+    worst_model : str
+        Name of the worst-performing model.
+    worst_reason : str
+        One-sentence explanation of the failure mode.
+    reference_model : str
+        The baseline / reference model used.
+    summary : str
+        A 2–3 sentence scientific summary (still useful for humans).
+    extra : dict
+        Domain-specific extras the grader may inspect.
+    """
+    best_model: str
+    best_reason: str
+    worst_model: str
+    worst_reason: str
+    reference_model: str
+    summary: str
+    extra: dict = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        """Serialize to a JSON string."""
+        return json.dumps(asdict(self), indent=2)
+
+    def save(self, output_dir: str | Path) -> Path:
+        """Write to agent_verdict.json in the given directory."""
+        path = Path(output_dir) / VERDICT_FILENAME
+        path.write_text(self.to_json())
+        return path
+
+    @classmethod
+    def load(cls, output_dir: str | Path) -> "AgentVerdict":
+        """Read from agent_verdict.json.
+
+        Raises FileNotFoundError if the file doesn't exist.
+        Raises json.JSONDecodeError or KeyError on malformed JSON.
+        """
+        path = Path(output_dir) / VERDICT_FILENAME
+        data = json.loads(path.read_text())
+        return cls(
+            best_model=data["best_model"],
+            best_reason=data["best_reason"],
+            worst_model=data["worst_model"],
+            worst_reason=data["worst_reason"],
+            reference_model=data["reference_model"],
+            summary=data["summary"],
+            extra=data.get("extra", {}),
+        )
+#+end_src
+
+
+* Updated Briefs — Asking for JSON
+
+The briefs change in two places:
+
+1. *Step 4*: "write =agent_verdict.json=" instead of =agent_summary.txt=
+2. *Constraints*: a =verdict_format= key specifying the JSON schema
+
+We keep =agent_summary.txt= mentioned /nowhere/ — a clean break.
+
+#+begin_src python :tangle ../src/dmt/agent/brief.py
+"""Structured agent briefs.
+
+A brief encodes:
+- What imports the agent has access to
+- What steps it must perform
+- What success looks like (grading criteria)
+"""
+
+from dataclasses import dataclass, field
+
+
+VERDICT_SCHEMA_DESCRIPTION = """\
+Write a JSON file called agent_verdict.json to the output directory with these fields:
+{
+  "best_model": "<name of best model>",
+  "best_reason": "<one sentence why>",
+  "worst_model": "<name of worst model>",
+  "worst_reason": "<one sentence why>",
+  "reference_model": "<name of baseline model>",
+  "summary": "<2-3 sentence scientific summary>"
+}"""
+
+
+@dataclass
+class AgentBrief:
+    """A machine-readable agent task specification."""
+
+    # Identity
+    name: str
+    description: str
+
+    # What the agent can import
+    imports: list[str] = field(default_factory=list)
+
+    # Step-by-step instructions
+    steps: list[str] = field(default_factory=list)
+
+    # Constraints
+    constraints: dict[str, str] = field(default_factory=dict)
+
+    # Success criteria (key -> human description)
+    success_criteria: dict[str, str] = field(default_factory=dict)
+
+    def to_prompt(self) -> str:
+        """Render the brief as a text prompt an LLM agent would receive."""
+        lines = [
+            f"**AGENT BRIEF: {self.name}**\n",
+            self.description + "\n",
+            "**Available imports**:",
+        ]
+        for imp in self.imports:
+            lines.append(f"- `{imp}`")
+        lines.append("\n**Your task**:")
+        for i, step in enumerate(self.steps, 1):
+            lines.append(f"{i}. {step}")
+        if self.constraints:
+            lines.append("\n**Constraints**:")
+            for key, val in self.constraints.items():
+                lines.append(f"- {key}: {val}")
+        if self.success_criteria:
+            lines.append("\n**Success criteria**:")
+            for key, val in self.success_criteria.items():
+                lines.append(f"- {key}: {val}")
+        return "\n".join(lines)
+
+
+# ── Pre-built briefs ──────────────────────────────────────────────────────
+
+DRUG_EFFICACY_BRIEF = AgentBrief(
+    name="Drug Efficacy Validation",
+    description=(
+        "You are a scientific computing agent. Your task is to evaluate "
+        "three drug efficacy models using the DMT validation framework."
+    ),
+    imports=[
+        "from dmt.evaluate import evaluate, DRUG_EFFICACY",
+        "from dmt.scenario.drug_efficacy import generate_observations, "
+        "LinearModel, SigmoidModel, CalibratedModel",
+    ],
+    steps=[
+        "Generate dose-response observations: obs = generate_observations()",
+        "Create three model instances: LinearModel(), SigmoidModel(), CalibratedModel()",
+        ("Call: evaluate(models=[linear, sigmoid, calibrated], "
+         "observations=obs, scenario=DRUG_EFFICACY, "
+         "reference_model=linear, output_dir=OUTPUT_DIR, "
+         "title='Drug Efficacy Model Comparison')"),
+        ("Read the generated report.md and write agent_verdict.json "
+         "to the output directory (see verdict_format constraint)"),
+    ],
+    constraints={
+        "reference_model": "Use LinearModel as the reference (baseline) model",
+        "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_drug_report/)",
+        "verdict_format": VERDICT_SCHEMA_DESCRIPTION,
+    },
+    success_criteria={
+        "report_exists": "The report file exists at the output directory",
+        "has_sections": (
+            "The report contains Abstract, Methods, Results, Discussion, Conclusion"
+        ),
+        "identifies_best": "Verdict correctly identifies the Calibrated model as best",
+        "identifies_worst": (
+            "Verdict correctly identifies the Linear model as worst"
+        ),
+    },
+)
+
+
+WEATHER_BRIEF = AgentBrief(
+    name="Weather Prediction Validation",
+    description=(
+        "You are a scientific computing agent. Your task is to evaluate "
+        "three weather prediction models using the DMT validation framework."
+    ),
+    imports=[
+        "from dmt.evaluate import evaluate, WEATHER",
+        "from dmt.scenario.weather import generate_observations, "
+        "PersistenceModel, ClimatologyModel, NoisyRegressionModel",
+    ],
+    steps=[
+        "Generate weather observations: obs = generate_observations(n_days=365, seed=42)",
+        ("Create three model instances: PersistenceModel(), "
+         "ClimatologyModel(), NoisyRegressionModel(alpha=0.7, noise_std=0.5)"),
+        ("Call: evaluate(models=[persistence, climatology, regression], "
+         "observations=obs, scenario=WEATHER, "
+         "reference_model=climatology, output_dir=OUTPUT_DIR, "
+         "title='Weather Prediction Model Comparison')"),
+        ("Read the generated report.md and write agent_verdict.json "
+         "to the output directory (see verdict_format constraint)"),
+    ],
+    constraints={
+        "reference_model": "Use ClimatologyModel as the reference (baseline) model",
+        "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_weather_report/)",
+        "verdict_format": VERDICT_SCHEMA_DESCRIPTION,
+    },
+    success_criteria={
+        "report_exists": "The report file exists at the output directory",
+        "has_sections": (
+            "The report contains Abstract, Methods, Results, Discussion, Conclusion"
+        ),
+        "identifies_best": (
+            "Verdict identifies NoisyRegression as the best model"
+        ),
+        "identifies_worst": (
+            "Verdict identifies the worst-performing model"
+        ),
+    },
+)
+#+end_src
+
+
+* The Grader — JSON-First, Prose Fallback
+
+The new grader tries =agent_verdict.json= first.  If found, grading is a
+simple field comparison — no keyword sets, no fragile pattern matching.
+
+For backward compatibility (and for LLMs that ignore the JSON instruction),
+we fall back to the old prose matching.  But the grader now marks this as
+=detail="(verdict via fallback prose matching)"= so you can see the difference.
+
+#+begin_src python :tangle ../src/dmt/agent/grader.py
+"""Grade an agent's output against success criteria.
+
+Lesson 06: structured JSON verdict is the primary grading path.
+Falls back to prose keyword matching if agent_verdict.json is absent.
+"""
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class CriterionResult:
+    """Result of evaluating a single success criterion."""
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass
+class GradeReport:
+    """Full grading report for an agent run."""
+    agent_name: str
+    criteria: list[CriterionResult] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        return all(c.passed for c in self.criteria)
+
+    @property
+    def pass_count(self) -> int:
+        return sum(1 for c in self.criteria if c.passed)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.criteria)
+
+    @property
+    def score(self) -> float:
+        if not self.criteria:
+            return 0.0
+        return self.pass_count / self.total_count
+
+    def summary(self) -> str:
+        lines = [
+            f"Agent: {self.agent_name}",
+            f"Score: {self.pass_count}/{self.total_count} "
+            f"({self.score:.0%})",
+            "",
+        ]
+        for c in self.criteria:
+            mark = "PASS" if c.passed else "FAIL"
+            lines.append(f"  [{mark}] {c.name}: {c.detail}")
+        return "\n".join(lines)
+
+
+# ── Verdict loading ──────────────────────────────────────────────────────
+
+def _load_verdict(output_dir: Path) -> dict | None:
+    """Try to load agent_verdict.json, return None if absent or invalid."""
+    verdict_path = output_dir / "agent_verdict.json"
+    if not verdict_path.exists():
+        return None
+    try:
+        return json.loads(verdict_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+# ── Prose fallback (kept for backward compatibility) ─────────────────────
+
+_POSITIVE_WORDS = frozenset({
+    "best", "lowest", "superior", "outperform", "outperforms",
+    "highest accuracy", "top", "winner", "strongest",
+})
+
+_NEGATIVE_WORDS = frozenset({
+    "worst", "fails", "failure", "poor", "poorest",
+    "highest rmse", "cannot capture", "inadequate",
+})
+
+
+def _text_contains_positive(text: str, entity: str) -> bool:
+    """Check if text positively identifies entity as the best."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _POSITIVE_WORDS)
+
+
+def _text_contains_negative(text: str, entity: str) -> bool:
+    """Check if text negatively identifies entity's limitations."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _NEGATIVE_WORDS)
+
+
+# ── Report section checker (shared) ─────────────────────────────────────
+
+def _check_report_sections(report_text: str) -> CriterionResult:
+    """Check that the report has all required sections."""
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    return CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    )
+
+
+# ── Domain-specific graders ──────────────────────────────────────────────
+
+def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's drug efficacy validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Drug Efficacy Validation")
+    report_path = output_dir / "report.md"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "identifies_best", "identifies_worst"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    report.criteria.append(_check_report_sections(report_text))
+
+    # ── Try structured verdict first ──────────────────────────────────
+    verdict = _load_verdict(output_dir)
+
+    if verdict is not None:
+        # ── Criterion 3: best_model == "CalibratedModel" (or close) ──
+        best = verdict.get("best_model", "")
+        calibrated_best = "calibrat" in best.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=calibrated_best,
+            detail=(
+                f"verdict.best_model={best!r}" if calibrated_best
+                else f"verdict.best_model={best!r} (expected Calibrated)"
+            ),
+        ))
+
+        # ── Criterion 4: worst_model == "LinearModel" (or close) ─────
+        worst = verdict.get("worst_model", "")
+        linear_worst = "linear" in worst.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_worst",
+            passed=linear_worst,
+            detail=(
+                f"verdict.worst_model={worst!r}" if linear_worst
+                else f"verdict.worst_model={worst!r} (expected Linear)"
+            ),
+        ))
+    else:
+        # ── Prose fallback ────────────────────────────────────────────
+        summary_path = output_dir / "agent_summary.txt"
+        summary_text = summary_path.read_text() if summary_path.exists() else ""
+
+        calibrated_best = _text_contains_positive(summary_text, "calibrated")
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=calibrated_best,
+            detail=(
+                "correctly identifies Calibrated (prose fallback)"
+                if calibrated_best
+                else "did not identify Calibrated as best model (prose fallback)"
+            ),
+        ))
+
+        linear_fails = _text_contains_negative(summary_text, "linear")
+        summary_lower = summary_text.lower()
+        if not linear_fails:
+            linear_fails = (
+                "linear" in summary_lower
+                and ("sigmoid" in summary_lower or "hill" in summary_lower)
+            )
+        report.criteria.append(CriterionResult(
+            name="identifies_worst",
+            passed=linear_fails,
+            detail=(
+                "correctly notes Linear failure (prose fallback)"
+                if linear_fails
+                else "did not identify Linear as worst (prose fallback)"
+            ),
+        ))
+
+    return report
+
+
+def grade_weather(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's weather prediction validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Weather Prediction Validation")
+    report_path = output_dir / "report.md"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "identifies_best", "identifies_reference"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    report.criteria.append(_check_report_sections(report_text))
+
+    # ── Try structured verdict first ──────────────────────────────────
+    verdict = _load_verdict(output_dir)
+
+    if verdict is not None:
+        # ── Criterion 3: best_model contains "Regression" ─────────────
+        best = verdict.get("best_model", "")
+        regression_best = "regression" in best.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=regression_best,
+            detail=(
+                f"verdict.best_model={best!r}" if regression_best
+                else f"verdict.best_model={best!r} (expected NoisyRegression)"
+            ),
+        ))
+
+        # ── Criterion 4: reference_model contains "Climatology" ───────
+        ref = verdict.get("reference_model", "")
+        climatology_ref = "climatology" in ref.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_reference",
+            passed=climatology_ref,
+            detail=(
+                f"verdict.reference_model={ref!r}" if climatology_ref
+                else f"verdict.reference_model={ref!r} (expected Climatology)"
+            ),
+        ))
+    else:
+        # ── Prose fallback ────────────────────────────────────────────
+        summary_path = output_dir / "agent_summary.txt"
+        summary_text = summary_path.read_text() if summary_path.exists() else ""
+
+        regression_best = _text_contains_positive(summary_text, "regression")
+        if not regression_best:
+            regression_best = _text_contains_positive(summary_text, "noisyregression")
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=regression_best,
+            detail=(
+                "correctly identifies NoisyRegression (prose fallback)"
+                if regression_best
+                else "did not identify NoisyRegression as best (prose fallback)"
+            ),
+        ))
+
+        summary_lower = summary_text.lower()
+        climatology_ref = (
+            "climatology" in summary_lower
+            and ("baseline" in summary_lower or "reference" in summary_lower
+                 or "benchmark" in summary_lower or "relative" in summary_lower
+                 or "compared" in summary_lower or "skill" in summary_lower)
+        )
+        report.criteria.append(CriterionResult(
+            name="identifies_reference",
+            passed=climatology_ref,
+            detail=(
+                "correctly references Climatology baseline (prose fallback)"
+                if climatology_ref
+                else "did not mention Climatology as reference (prose fallback)"
+            ),
+        ))
+
+    return report
+
+
+# ── Grader dispatch ──────────────────────────────────────────────────────
+
+GRADERS = {
+    "Drug Efficacy Validation": grade_drug_efficacy,
+    "Weather Prediction Validation": grade_weather,
+}
+
+
+def grade_output(brief_name: str, output_dir: str | Path) -> GradeReport:
+    """Grade agent output using the appropriate domain grader."""
+    grader = GRADERS.get(brief_name)
+    if grader is None:
+        raise ValueError(
+            f"No grader for brief '{brief_name}'. "
+            f"Available: {list(GRADERS.keys())}"
+        )
+    return grader(output_dir)
+#+end_src
+
+
+* Updated LLM Runner — JSON in the System Prompt
+
+The system prompt tells the LLM to write =agent_verdict.json= with the
+specified schema.  We keep it simple: the schema is described inline.
+
+#+begin_src python :tangle ../src/dmt/agent/llm_runner.py
+"""Send an agent brief to an LLM and execute the generated code.
+
+Currently supports Anthropic Claude.  The runner:
+1. Sends the brief as a user message
+2. Extracts a Python script from the response
+3. Writes it to a temp file and runs it in a subprocess
+4. Returns the AgentResult for grading
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dmt.agent.brief import AgentBrief
+from dmt.agent.runner import AgentResult
+
+
+@dataclass
+class LLMResponse:
+    """Raw response from the LLM."""
+    model: str
+    raw_text: str
+    extracted_code: str
+    usage: dict = field(default_factory=dict)
+
+
+def _extract_python_code(text: str) -> str:
+    """Extract Python code from a markdown-fenced response.
+
+    Looks for ```python ... ``` blocks.  If multiple blocks exist,
+    concatenates them (the agent may split imports from main logic).
+    If no fenced blocks, assumes the entire response is code.
+    """
+    blocks = re.findall(r"```python\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return "\n\n".join(blocks)
+    # Fallback: try generic code fence
+    blocks = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return "\n\n".join(blocks)
+    # Last resort: the whole thing
+    return text
+
+
+def call_claude(
+    brief: AgentBrief,
+    output_dir: str | Path,
+    model: str = "claude-sonnet-4-20250514",
+    max_tokens: int = 4096,
+) -> LLMResponse:
+    """Send the brief to Claude and get back a response.
+
+    Requires ANTHROPIC_API_KEY in the environment.
+
+    Raises
+    ------
+    RuntimeError
+        If ANTHROPIC_API_KEY is not set or empty.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set or empty.\n"
+            "Set it with: export ANTHROPIC_API_KEY='sk-ant-...'"
+        )
+
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    output_dir = Path(output_dir)
+    system_prompt = (
+        "You are a scientific computing agent. "
+        "Respond with a single, complete Python script that accomplishes "
+        "the task described in the brief. The script must:\n"
+        "- Be self-contained (all imports at the top)\n"
+        "- Write outputs to the directory specified in the constraints\n"
+        "- Write a file called 'agent_verdict.json' to the output directory "
+        "containing a structured JSON verdict with these exact keys: "
+        "best_model, best_reason, worst_model, worst_reason, "
+        "reference_model, summary\n"
+        "- Use json.dumps() with indent=2 to write the verdict\n"
+        "- Use only the imports listed in the brief (plus json from stdlib)\n"
+        "- Be executable with: python script.py <output_dir>\n\n"
+        "Wrap your code in a ```python code fence."
+    )
+
+    user_message = (
+        brief.to_prompt()
+        + f"\n\nThe output directory is: {output_dir}\n"
+        "Respond with only the Python script."
+    )
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    raw_text = response.content[0].text
+    code = _extract_python_code(raw_text)
+
+    return LLMResponse(
+        model=model,
+        raw_text=raw_text,
+        extracted_code=code,
+        usage={
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        },
+    )
+
+
+def run_llm_agent(
+    brief: AgentBrief,
+    output_dir: str | Path,
+    model: str = "claude-sonnet-4-20250514",
+    repo_root: str | Path | None = None,
+    max_tokens: int = 4096,
+    timeout: int = 60,
+) -> tuple[LLMResponse, AgentResult]:
+    """Full pipeline: brief -> Claude -> code -> execute -> result.
+
+    Parameters
+    ----------
+    brief : AgentBrief
+        The task specification.
+    output_dir : path
+        Where the agent should write its outputs.
+    model : str
+        Claude model to use.
+    repo_root : path, optional
+        Working directory for execution (must have dmt importable).
+        If None, uses the dmt-eval repo root.
+    max_tokens : int
+        Max tokens for Claude response.
+    timeout : int
+        Max seconds for the generated script to run.
+
+    Returns (LLMResponse, AgentResult).
+    """
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get the LLM's code
+    llm_response = call_claude(brief, output_dir, model, max_tokens)
+
+    # Write the code to a temp file
+    script_dir = output_dir / "_agent_workspace"
+    script_dir.mkdir(exist_ok=True)
+    script_path = script_dir / "agent_script.py"
+    script_path.write_text(llm_response.extracted_code)
+
+    # Also save the raw response for debugging
+    (script_dir / "llm_raw_response.txt").write_text(llm_response.raw_text)
+
+    # Determine repo root for PYTHONPATH
+    if repo_root is None:
+        # Walk up from this file to find pyproject.toml
+        candidate = Path(__file__).resolve().parent
+        while candidate != candidate.parent:
+            if (candidate / "pyproject.toml").exists():
+                repo_root = candidate
+                break
+            candidate = candidate.parent
+        else:
+            repo_root = Path.cwd()
+    repo_root = Path(repo_root)
+
+    # Execute the script
+    env = os.environ.copy()
+    src_path = str(repo_root / "src")
+    if "PYTHONPATH" in env:
+        env["PYTHONPATH"] = src_path + os.pathsep + env["PYTHONPATH"]
+    else:
+        env["PYTHONPATH"] = src_path
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), str(output_dir)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=str(repo_root),
+        env=env,
+    )
+
+    agent_result = AgentResult(
+        return_code=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        output_dir=output_dir,
+    )
+
+    return llm_response, agent_result
+#+end_src
+
+
+* Updated Simulated Agent — Writing JSON
+
+The simulated agent now writes =agent_verdict.json= instead of
+=agent_summary.txt=.  It still parses the report to find the best/worst
+model — but the output is structured.
+
+#+begin_src python :tangle ../scripts/simulated_agent.py
+"""Simulated agent: follows the Drug Efficacy brief verbatim.
+
+This script represents what a well-functioning AI agent would produce
+when given the agent brief.  It uses only the public DMT API
+referenced in the brief.
+
+Lesson 06: writes agent_verdict.json (structured) instead of agent_summary.txt.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+# ── Step 0: The brief said these are our available imports ──────────────
+from dmt.evaluate import evaluate, DRUG_EFFICACY
+from dmt.scenario.drug_efficacy import (
+    generate_observations,
+    LinearModel,
+    SigmoidModel,
+    CalibratedModel,
+)
+
+
+def main(output_dir: str = "./agent_drug_report") -> dict:
+    """Execute the agent brief and return results."""
+    output_dir = Path(output_dir)
+
+    # ── Step 1: Generate observations ─────────────────────────────────
+    observations = generate_observations()
+
+    # ── Step 2: Create model instances ────────────────────────────────
+    linear = LinearModel()
+    sigmoid = SigmoidModel()
+    calibrated = CalibratedModel()
+
+    # ── Step 3: Evaluate ──────────────────────────────────────────────
+    report_path = evaluate(
+        models=[linear, sigmoid, calibrated],
+        observations=observations,
+        scenario=DRUG_EFFICACY,
+        reference_model=linear,
+        output_dir=output_dir,
+        title="Drug Efficacy Model Comparison",
+    )
+
+    # ── Step 4: Read report and write structured verdict ──────────────
+    report_text = report_path.read_text()
+
+    # Parse the Overall Performance table to find best/worst model.
+    best_model = None
+    worst_model = None
+    best_rmse = float("inf")
+    worst_rmse = float("-inf")
+
+    in_summary = False
+    for line in report_text.split("\n"):
+        if "Overall Performance" in line:
+            in_summary = True
+            continue
+        if in_summary and line.startswith("## "):
+            break
+        if not in_summary:
+            continue
+        if "|" in line and "model" not in line.lower() and "---" not in line:
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            if len(parts) >= 2:
+                try:
+                    model_name = parts[0]
+                    rmse = float(parts[1])
+                    if rmse < best_rmse:
+                        best_rmse = rmse
+                        best_model = model_name
+                    if rmse > worst_rmse:
+                        worst_rmse = rmse
+                        worst_model = model_name
+                except (ValueError, IndexError):
+                    continue
+
+    verdict = {
+        "best_model": best_model,
+        "best_reason": (
+            f"Achieves the lowest RMSE ({best_rmse:.2f}), "
+            f"outperforming all other models on drug efficacy prediction."
+        ),
+        "worst_model": worst_model,
+        "worst_reason": (
+            "A linear assumption fails to capture the sigmoidal "
+            "dose-response relationship described by Hill equation kinetics."
+        ),
+        "reference_model": "LinearModel",
+        "summary": (
+            f"The {best_model} model achieves the lowest RMSE ({best_rmse:.2f}), "
+            f"outperforming all other models on the drug efficacy prediction task. "
+            f"The {worst_model} model performs worst because a linear assumption "
+            f"fundamentally fails to capture the sigmoidal dose-response relationship. "
+            f"Model structure must match the underlying biology."
+        ),
+    }
+
+    verdict_path = output_dir / "agent_verdict.json"
+    verdict_path.write_text(json.dumps(verdict, indent=2))
+
+    return verdict
+
+
+if __name__ == "__main__":
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "./agent_drug_report"
+    result = main(output_dir)
+    print(f"Best model: {result['best_model']}")
+    print(f"Worst model: {result['worst_model']}")
+    print(f"\nVerdict written to {output_dir}/agent_verdict.json")
+#+end_src
+
+
+* Updated Runner — Verdict Path Property
+
+The =AgentResult= gains a =verdict_path= property alongside the existing
+=summary_path=.
+
+#+begin_src python :tangle ../src/dmt/agent/runner.py
+"""Run an agent script in a subprocess and capture its output."""
+
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class AgentResult:
+    """Captured result from running an agent."""
+    return_code: int
+    stdout: str
+    stderr: str
+    output_dir: Path
+
+    @property
+    def success(self) -> bool:
+        return self.return_code == 0
+
+    @property
+    def report_path(self) -> Path:
+        return self.output_dir / "report.md"
+
+    @property
+    def verdict_path(self) -> Path:
+        return self.output_dir / "agent_verdict.json"
+
+    @property
+    def summary_path(self) -> Path:
+        """Legacy: agent_summary.txt (pre-Lesson 06)."""
+        return self.output_dir / "agent_summary.txt"
+
+    @property
+    def report_exists(self) -> bool:
+        return self.report_path.exists()
+
+    @property
+    def verdict_exists(self) -> bool:
+        return self.verdict_path.exists()
+
+    @property
+    def summary_exists(self) -> bool:
+        """Legacy: check for agent_summary.txt."""
+        return self.summary_path.exists()
+
+
+def run_agent(script_path: str | Path, output_dir: str | Path,
+              python: str | None = None,
+              timeout: int = 60) -> AgentResult:
+    """Execute an agent script in a subprocess.
+
+    Parameters
+    ----------
+    script_path : path
+        The agent script to run.
+    output_dir : path
+        Passed as the first argument to the script.
+    python : str, optional
+        Python interpreter.  If None, uses the current interpreter.
+    timeout : int
+        Maximum seconds to allow the agent to run.
+
+    Returns an AgentResult with captured stdout/stderr.
+    """
+    script_path = Path(script_path)
+    output_dir = Path(output_dir)
+    python = python or sys.executable
+
+    result = subprocess.run(
+        [python, str(script_path), str(output_dir)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=script_path.parent.parent,  # repo root
+    )
+
+    return AgentResult(
+        return_code=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        output_dir=output_dir,
+    )
+#+end_src
+
+
+* Updated Live Agent Test
+
+The Lesson 03 test asserted =summary_exists= (agent_summary.txt).  Since the
+simulated agent now writes =agent_verdict.json=, we update the test accordingly.
+
+#+begin_src python :tangle ../test/test_live_agent.py
+"""End-to-end test: run the simulated agent, grade its output.
+
+This is DMT testing itself: the framework is the model, the agent's
+success/failure is the data, and the grading criteria are the test.
+
+Lesson 06: updated to expect agent_verdict.json instead of agent_summary.txt.
+"""
+
+from pathlib import Path
+
+from dmt.agent.runner import run_agent
+from dmt.agent.grader import grade_drug_efficacy
+
+
+# Path to the simulated agent script (relative to repo root)
+AGENT_SCRIPT = Path(__file__).parent.parent / "scripts" / "simulated_agent.py"
+
+
+def test_simulated_agent_produces_report(tmp_path):
+    """The simulated agent should produce a valid report and verdict."""
+    result = run_agent(AGENT_SCRIPT, output_dir=tmp_path / "agent_output")
+
+    assert result.success, (
+        f"Agent script failed with return code {result.return_code}.\n"
+        f"stderr: {result.stderr}"
+    )
+    assert result.report_exists, "Agent did not produce report.md"
+    assert result.verdict_exists, "Agent did not produce agent_verdict.json"
+
+
+def test_simulated_agent_passes_all_criteria(tmp_path):
+    """The simulated agent's output should pass all grading criteria."""
+    output_dir = tmp_path / "agent_output"
+
+    # Run the agent
+    result = run_agent(AGENT_SCRIPT, output_dir=output_dir)
+    assert result.success, f"Agent failed: {result.stderr}"
+
+    # Grade the output
+    grade = grade_drug_efficacy(output_dir)
+
+    # Print the grade report for visibility
+    print("\n" + grade.summary())
+
+    # Assert all criteria pass
+    for criterion in grade.criteria:
+        assert criterion.passed, (
+            f"Criterion '{criterion.name}' FAILED: {criterion.detail}"
+        )
+
+    assert grade.all_passed, (
+        f"Agent scored {grade.pass_count}/{grade.total_count}"
+    )
+
+
+def test_grade_report_structure(tmp_path):
+    """The grade report should have the expected structure."""
+    output_dir = tmp_path / "agent_output"
+    result = run_agent(AGENT_SCRIPT, output_dir=output_dir)
+    assert result.success
+
+    grade = grade_drug_efficacy(output_dir)
+
+    assert grade.agent_name == "Drug Efficacy Validation"
+    assert grade.total_count == 4
+    assert grade.score == 1.0
+    assert "PASS" in grade.summary()
+    assert "FAIL" not in grade.summary()
+
+
+def test_agent_brief_is_self_contained():
+    """The brief alone should contain all information needed."""
+    from dmt.agent.brief import DRUG_EFFICACY_BRIEF
+
+    prompt = DRUG_EFFICACY_BRIEF.to_prompt()
+
+    # The brief mentions all necessary imports
+    assert "dmt.evaluate" in prompt
+    assert "dmt.scenario.drug_efficacy" in prompt
+    assert "evaluate" in prompt
+    assert "DRUG_EFFICACY" in prompt
+
+    # The brief has all four steps
+    assert "generate_observations" in prompt
+    assert "LinearModel" in prompt
+    assert "evaluate(models=" in prompt
+    assert "verdict" in prompt.lower()
+
+    # The brief has success criteria
+    assert "report" in prompt.lower()
+    assert "Calibrated" in prompt
+#+end_src
+
+
+* Tests
+
+We test three things:
+
+1. The =AgentVerdict= dataclass: round-trip JSON serialization
+2. The JSON grading path: structured verdicts produce deterministic grades
+3. The prose fallback: old-style outputs still grade correctly
+4. The simulated agent: end-to-end with JSON output
+
+#+begin_src python :tangle ../test/test_structured_output.py
+"""Tests for Lesson 06: structured output (agent_verdict.json).
+
+Tests the verdict schema, JSON-based grading, and prose fallback.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from dmt.agent.verdict import AgentVerdict, VERDICT_FILENAME
+from dmt.agent.grader import grade_drug_efficacy, grade_weather, grade_output
+
+
+# ── AgentVerdict tests ───────────────────────────────────────────────────
+
+class TestAgentVerdict:
+
+    def test_round_trip_json(self, tmp_path):
+        """Verdict should survive save/load cycle."""
+        v = AgentVerdict(
+            best_model="CalibratedModel",
+            best_reason="lowest RMSE",
+            worst_model="LinearModel",
+            worst_reason="fails on sigmoidal data",
+            reference_model="LinearModel",
+            summary="The CalibratedModel is best.",
+        )
+        v.save(tmp_path)
+        loaded = AgentVerdict.load(tmp_path)
+
+        assert loaded.best_model == v.best_model
+        assert loaded.worst_model == v.worst_model
+        assert loaded.reference_model == v.reference_model
+        assert loaded.summary == v.summary
+
+    def test_to_json_is_valid(self):
+        """to_json should produce parseable JSON."""
+        v = AgentVerdict(
+            best_model="A", best_reason="r",
+            worst_model="B", worst_reason="r",
+            reference_model="C", summary="s",
+        )
+        data = json.loads(v.to_json())
+        assert data["best_model"] == "A"
+        assert data["worst_model"] == "B"
+
+    def test_extra_field_preserved(self, tmp_path):
+        """Extra domain-specific fields should survive round-trip."""
+        v = AgentVerdict(
+            best_model="A", best_reason="r",
+            worst_model="B", worst_reason="r",
+            reference_model="C", summary="s",
+            extra={"rmse": 0.42, "domain": "weather"},
+        )
+        v.save(tmp_path)
+        loaded = AgentVerdict.load(tmp_path)
+        assert loaded.extra["rmse"] == 0.42
+        assert loaded.extra["domain"] == "weather"
+
+    def test_load_missing_raises(self, tmp_path):
+        """Loading from a directory without verdict should raise."""
+        with pytest.raises(FileNotFoundError):
+            AgentVerdict.load(tmp_path)
+
+    def test_verdict_filename_constant(self):
+        """The filename should be agent_verdict.json."""
+        assert VERDICT_FILENAME == "agent_verdict.json"
+
+
+# ── JSON grading: Drug Efficacy ──────────────────────────────────────────
+
+def _make_report(tmp_path: Path) -> None:
+    """Create a minimal valid report.md."""
+    (tmp_path / "report.md").write_text(
+        "# Report\n\n"
+        "## Abstract\n\ntext\n\n"
+        "## Introduction\n\ntext\n\n"
+        "## Methods\n\ntext\n\n"
+        "## Results\n\ntext\n\n"
+        "## Discussion\n\ntext\n\n"
+        "## Conclusion\n\ntext\n"
+    )
+
+
+def test_drug_grader_json_all_pass(tmp_path):
+    """Drug grader should pass with correct JSON verdict."""
+    _make_report(tmp_path)
+    verdict = {
+        "best_model": "CalibratedModel",
+        "best_reason": "lowest RMSE on dose-response",
+        "worst_model": "LinearModel",
+        "worst_reason": "fails on sigmoidal data",
+        "reference_model": "LinearModel",
+        "summary": "Calibrated is best, Linear is worst.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
+
+    grade = grade_drug_efficacy(tmp_path)
+    assert grade.all_passed, grade.summary()
+    assert grade.score == 1.0
+    # Verify it used JSON path (no "prose fallback" in detail)
+    for c in grade.criteria:
+        assert "prose fallback" not in c.detail
+
+
+def test_drug_grader_json_wrong_best(tmp_path):
+    """Drug grader should fail when JSON names the wrong best model."""
+    _make_report(tmp_path)
+    verdict = {
+        "best_model": "LinearModel",
+        "best_reason": "somehow",
+        "worst_model": "LinearModel",
+        "worst_reason": "actually this",
+        "reference_model": "LinearModel",
+        "summary": "Wrong.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
+
+    grade = grade_drug_efficacy(tmp_path)
+    best_criterion = next(c for c in grade.criteria if c.name == "identifies_best")
+    assert not best_criterion.passed
+    assert "expected Calibrated" in best_criterion.detail
+
+
+def test_drug_grader_json_wrong_worst(tmp_path):
+    """Drug grader should fail when JSON names the wrong worst model."""
+    _make_report(tmp_path)
+    verdict = {
+        "best_model": "CalibratedModel",
+        "best_reason": "good",
+        "worst_model": "SigmoidModel",
+        "worst_reason": "not really",
+        "reference_model": "LinearModel",
+        "summary": "Wrong worst.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
+
+    grade = grade_drug_efficacy(tmp_path)
+    worst_criterion = next(c for c in grade.criteria if c.name == "identifies_worst")
+    assert not worst_criterion.passed
+    assert "expected Linear" in worst_criterion.detail
+
+
+# ── JSON grading: Weather ────────────────────────────────────────────────
+
+def test_weather_grader_json_all_pass(tmp_path):
+    """Weather grader should pass with correct JSON verdict."""
+    _make_report(tmp_path)
+    verdict = {
+        "best_model": "NoisyRegressionModel",
+        "best_reason": "lowest RMSE",
+        "worst_model": "PersistenceModel",
+        "worst_reason": "cannot adapt to seasonal shifts",
+        "reference_model": "ClimatologyModel",
+        "summary": "Regression is best, Climatology is baseline.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
+
+    grade = grade_weather(tmp_path)
+    assert grade.all_passed, grade.summary()
+    assert grade.score == 1.0
+
+
+def test_weather_grader_json_wrong_reference(tmp_path):
+    """Weather grader should fail when reference model is wrong."""
+    _make_report(tmp_path)
+    verdict = {
+        "best_model": "NoisyRegressionModel",
+        "best_reason": "lowest RMSE",
+        "worst_model": "PersistenceModel",
+        "worst_reason": "bad",
+        "reference_model": "PersistenceModel",
+        "summary": "wrong ref.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
+
+    grade = grade_weather(tmp_path)
+    ref_criterion = next(c for c in grade.criteria if c.name == "identifies_reference")
+    assert not ref_criterion.passed
+    assert "expected Climatology" in ref_criterion.detail
+
+
+# ── Prose fallback ───────────────────────────────────────────────────────
+
+def test_drug_grader_prose_fallback(tmp_path):
+    """Drug grader should fall back to prose when no JSON exists."""
+    _make_report(tmp_path)
+    (tmp_path / "agent_summary.txt").write_text(
+        "The CalibratedModel achieves the best performance with lowest RMSE. "
+        "The LinearModel fails to capture the sigmoidal dose-response."
+    )
+
+    grade = grade_drug_efficacy(tmp_path)
+    assert grade.all_passed, grade.summary()
+    # Verify it used the fallback path
+    for c in grade.criteria:
+        if c.name in ("identifies_best", "identifies_worst"):
+            assert "prose fallback" in c.detail
+
+
+def test_weather_grader_prose_fallback(tmp_path):
+    """Weather grader should fall back to prose when no JSON exists."""
+    _make_report(tmp_path)
+    (tmp_path / "agent_summary.txt").write_text(
+        "The NoisyRegression model achieves the best performance "
+        "with the lowest RMSE across all cities. "
+        "Compared to the Climatology baseline, it shows significant "
+        "improvement in capturing day-to-day weather variability."
+    )
+
+    grade = grade_weather(tmp_path)
+    assert grade.all_passed, grade.summary()
+    for c in grade.criteria:
+        if c.name in ("identifies_best", "identifies_reference"):
+            assert "prose fallback" in c.detail
+
+
+# ── Simulated agent end-to-end ───────────────────────────────────────────
+
+def test_simulated_agent_writes_verdict(tmp_path):
+    """The simulated agent should produce agent_verdict.json."""
+    from dmt.agent.runner import run_agent
+
+    script = Path(__file__).parent.parent / "scripts" / "simulated_agent.py"
+    output_dir = tmp_path / "agent_output"
+    result = run_agent(script, output_dir)
+
+    assert result.success, f"Agent failed: {result.stderr}"
+    assert result.verdict_exists, "No agent_verdict.json produced"
+
+    verdict = AgentVerdict.load(output_dir)
+    assert "calibrat" in verdict.best_model.lower()
+    assert "linear" in verdict.worst_model.lower()
+
+
+def test_simulated_agent_passes_json_grading(tmp_path):
+    """The simulated agent should score 4/4 via JSON grading."""
+    from dmt.agent.runner import run_agent
+
+    script = Path(__file__).parent.parent / "scripts" / "simulated_agent.py"
+    output_dir = tmp_path / "agent_output"
+    result = run_agent(script, output_dir)
+    assert result.success, f"Agent failed: {result.stderr}"
+
+    grade = grade_drug_efficacy(output_dir)
+    print("\n" + grade.summary())
+
+    assert grade.all_passed, grade.summary()
+    # Verify it used JSON path
+    for c in grade.criteria:
+        assert "prose fallback" not in c.detail
+#+end_src
+
+
+* What We've Built
+
+After this lesson, the grading pipeline is:
+
+#+begin_example
+  Agent output directory
+  ├── report.md               (unchanged)
+  ├── agent_verdict.json      (NEW — structured output)
+  └── agent_summary.txt       (deprecated, fallback only)
+
+  Grading flow:
+  1. report.md exists?         → criterion 1
+  2. has required sections?    → criterion 2
+  3. agent_verdict.json found? → check fields directly (deterministic)
+     └── not found?            → fall back to agent_summary.txt (keyword scan)
+#+end_example
+
+| Component       | Lesson 05          | Lesson 06              |
+|-----------------+--------------------+------------------------|
+| Agent output    | prose summary.txt  | JSON verdict.json      |
+| Grading method  | keyword matching   | field comparison       |
+| Determinism     | fragile            | deterministic          |
+| Backward compat | N/A                | prose fallback         |
+| Schema          | none               | AgentVerdict dataclass |
+
+The natural next lesson: *Lesson 07 — Schema Validation* (using Pydantic or
+jsonschema to validate the verdict before grading, catching malformed JSON
+from weaker LLMs).
+
+
+* Requirements                                                     :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 06-structured-output
+tag: lesson/06-structured-output
+depends_on: 05-tournament
+files_created:
+  - src/dmt/agent/verdict.py
+files_modified:
+  - src/dmt/agent/brief.py
+  - src/dmt/agent/grader.py
+  - src/dmt/agent/llm_runner.py
+  - src/dmt/agent/runner.py
+  - scripts/simulated_agent.py
+files_tested:
+  - test/test_structured_output.py
+verification:
+  - "uv run --extra dev pytest test/ -v — all tests pass"
+  - "agent_verdict.json round-trips correctly"
+  - "JSON grading produces deterministic results"
+  - "prose fallback still works for old-style output"
+next_lesson: 07-schema-validation
+#+end_src
+
+* Local Variables                                                  :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

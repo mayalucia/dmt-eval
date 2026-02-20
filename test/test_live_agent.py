@@ -2,6 +2,8 @@
 
 This is DMT testing itself: the framework is the model, the agent's
 success/failure is the data, and the grading criteria are the test.
+
+Lesson 06: updated to expect agent_verdict.json instead of agent_summary.txt.
 """
 
 from pathlib import Path
@@ -15,7 +17,7 @@ AGENT_SCRIPT = Path(__file__).parent.parent / "scripts" / "simulated_agent.py"
 
 
 def test_simulated_agent_produces_report(tmp_path):
-    """The simulated agent should produce a valid report."""
+    """The simulated agent should produce a valid report and verdict."""
     result = run_agent(AGENT_SCRIPT, output_dir=tmp_path / "agent_output")
 
     assert result.success, (
@@ -23,7 +25,7 @@ def test_simulated_agent_produces_report(tmp_path):
         f"stderr: {result.stderr}"
     )
     assert result.report_exists, "Agent did not produce report.md"
-    assert result.summary_exists, "Agent did not produce agent_summary.txt"
+    assert result.verdict_exists, "Agent did not produce agent_verdict.json"
 
 
 def test_simulated_agent_passes_all_criteria(tmp_path):
@@ -82,8 +84,8 @@ def test_agent_brief_is_self_contained():
     assert "generate_observations" in prompt
     assert "LinearModel" in prompt
     assert "evaluate(models=" in prompt
-    assert "summary" in prompt.lower()
+    assert "verdict" in prompt.lower()
 
     # The brief has success criteria
-    assert "report.md" in prompt or "report" in prompt.lower()
+    assert "report" in prompt.lower()
     assert "Calibrated" in prompt

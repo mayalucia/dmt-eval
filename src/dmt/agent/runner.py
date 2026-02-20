@@ -23,7 +23,12 @@ class AgentResult:
         return self.output_dir / "report.md"
 
     @property
+    def verdict_path(self) -> Path:
+        return self.output_dir / "agent_verdict.json"
+
+    @property
     def summary_path(self) -> Path:
+        """Legacy: agent_summary.txt (pre-Lesson 06)."""
         return self.output_dir / "agent_summary.txt"
 
     @property
@@ -31,7 +36,12 @@ class AgentResult:
         return self.report_path.exists()
 
     @property
+    def verdict_exists(self) -> bool:
+        return self.verdict_path.exists()
+
+    @property
     def summary_exists(self) -> bool:
+        """Legacy: check for agent_summary.txt."""
         return self.summary_path.exists()
 
 

@@ -1,5 +1,10 @@
-"""Grade an agent's output against success criteria."""
+"""Grade an agent's output against success criteria.
 
+Lesson 06: structured JSON verdict is the primary grading path.
+Falls back to prose keyword matching if agent_verdict.json is absent.
+"""
+
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,7 +54,20 @@ class GradeReport:
         return "\n".join(lines)
 
 
-# ── Semantic keyword matching ──────────────────────────────────────────────
+# ── Verdict loading ──────────────────────────────────────────────────────
+
+def _load_verdict(output_dir: Path) -> dict | None:
+    """Try to load agent_verdict.json, return None if absent or invalid."""
+    verdict_path = output_dir / "agent_verdict.json"
+    if not verdict_path.exists():
+        return None
+    try:
+        return json.loads(verdict_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+# ── Prose fallback (kept for backward compatibility) ─────────────────────
 
 _POSITIVE_WORDS = frozenset({
     "best", "lowest", "superior", "outperform", "outperforms",
@@ -80,14 +98,26 @@ def _text_contains_negative(text: str, entity: str) -> bool:
     return any(w in text for w in _NEGATIVE_WORDS)
 
 
-# ── Domain-specific graders ────────────────────────────────────────────────
+# ── Report section checker (shared) ─────────────────────────────────────
+
+def _check_report_sections(report_text: str) -> CriterionResult:
+    """Check that the report has all required sections."""
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    return CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    )
+
+
+# ── Domain-specific graders ──────────────────────────────────────────────
 
 def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     """Grade an agent's drug efficacy validation output."""
     output_dir = Path(output_dir)
     report = GradeReport(agent_name="Drug Efficacy Validation")
     report_path = output_dir / "report.md"
-    summary_path = output_dir / "agent_summary.txt"
 
     # ── Criterion 1: Report exists ────────────────────────────────────
     exists = report_path.exists()
@@ -107,46 +137,67 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     report_text = report_path.read_text()
 
     # ── Criterion 2: Has required sections ────────────────────────────
-    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
-    missing = [s for s in required if f"## {s}" not in report_text]
-    report.criteria.append(CriterionResult(
-        name="has_sections",
-        passed=len(missing) == 0,
-        detail="all present" if not missing else f"missing: {missing}",
-    ))
+    report.criteria.append(_check_report_sections(report_text))
 
-    # ── Criterion 3: Identifies Calibrated as best ────────────────────
-    summary_text = ""
-    if summary_path.exists():
-        summary_text = summary_path.read_text()
+    # ── Try structured verdict first ──────────────────────────────────
+    verdict = _load_verdict(output_dir)
 
-    calibrated_best = _text_contains_positive(summary_text, "calibrated")
-    report.criteria.append(CriterionResult(
-        name="identifies_best",
-        passed=calibrated_best,
-        detail=(
-            "correctly identifies Calibrated" if calibrated_best
-            else "did not identify Calibrated as best model"
-        ),
-    ))
+    if verdict is not None:
+        # ── Criterion 3: best_model == "CalibratedModel" (or close) ──
+        best = verdict.get("best_model", "")
+        calibrated_best = "calibrat" in best.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=calibrated_best,
+            detail=(
+                f"verdict.best_model={best!r}" if calibrated_best
+                else f"verdict.best_model={best!r} (expected Calibrated)"
+            ),
+        ))
 
-    # ── Criterion 4: Notes Linear failure ─────────────────────────────
-    linear_fails = _text_contains_negative(summary_text, "linear")
-    # Also check for domain-specific reasoning
-    summary_lower = summary_text.lower()
-    if not linear_fails:
-        linear_fails = (
-            "linear" in summary_lower
-            and ("sigmoid" in summary_lower or "hill" in summary_lower)
-        )
-    report.criteria.append(CriterionResult(
-        name="identifies_worst",
-        passed=linear_fails,
-        detail=(
-            "correctly notes Linear failure" if linear_fails
-            else "did not explain Linear model's failure mode"
-        ),
-    ))
+        # ── Criterion 4: worst_model == "LinearModel" (or close) ─────
+        worst = verdict.get("worst_model", "")
+        linear_worst = "linear" in worst.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_worst",
+            passed=linear_worst,
+            detail=(
+                f"verdict.worst_model={worst!r}" if linear_worst
+                else f"verdict.worst_model={worst!r} (expected Linear)"
+            ),
+        ))
+    else:
+        # ── Prose fallback ────────────────────────────────────────────
+        summary_path = output_dir / "agent_summary.txt"
+        summary_text = summary_path.read_text() if summary_path.exists() else ""
+
+        calibrated_best = _text_contains_positive(summary_text, "calibrated")
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=calibrated_best,
+            detail=(
+                "correctly identifies Calibrated (prose fallback)"
+                if calibrated_best
+                else "did not identify Calibrated as best model (prose fallback)"
+            ),
+        ))
+
+        linear_fails = _text_contains_negative(summary_text, "linear")
+        summary_lower = summary_text.lower()
+        if not linear_fails:
+            linear_fails = (
+                "linear" in summary_lower
+                and ("sigmoid" in summary_lower or "hill" in summary_lower)
+            )
+        report.criteria.append(CriterionResult(
+            name="identifies_worst",
+            passed=linear_fails,
+            detail=(
+                "correctly notes Linear failure (prose fallback)"
+                if linear_fails
+                else "did not identify Linear as worst (prose fallback)"
+            ),
+        ))
 
     return report
 
@@ -156,7 +207,6 @@ def grade_weather(output_dir: str | Path) -> GradeReport:
     output_dir = Path(output_dir)
     report = GradeReport(agent_name="Weather Prediction Validation")
     report_path = output_dir / "report.md"
-    summary_path = output_dir / "agent_summary.txt"
 
     # ── Criterion 1: Report exists ────────────────────────────────────
     exists = report_path.exists()
@@ -176,53 +226,74 @@ def grade_weather(output_dir: str | Path) -> GradeReport:
     report_text = report_path.read_text()
 
     # ── Criterion 2: Has required sections ────────────────────────────
-    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
-    missing = [s for s in required if f"## {s}" not in report_text]
-    report.criteria.append(CriterionResult(
-        name="has_sections",
-        passed=len(missing) == 0,
-        detail="all present" if not missing else f"missing: {missing}",
-    ))
+    report.criteria.append(_check_report_sections(report_text))
 
-    # ── Criterion 3: Identifies NoisyRegression as best ───────────────
-    summary_text = ""
-    if summary_path.exists():
-        summary_text = summary_path.read_text()
+    # ── Try structured verdict first ──────────────────────────────────
+    verdict = _load_verdict(output_dir)
 
-    regression_best = _text_contains_positive(summary_text, "regression")
-    # Also accept "NoisyRegression" as a variant
-    if not regression_best:
-        regression_best = _text_contains_positive(summary_text, "noisyregression")
-    report.criteria.append(CriterionResult(
-        name="identifies_best",
-        passed=regression_best,
-        detail=(
-            "correctly identifies NoisyRegression" if regression_best
-            else "did not identify NoisyRegression as best model"
-        ),
-    ))
+    if verdict is not None:
+        # ── Criterion 3: best_model contains "Regression" ─────────────
+        best = verdict.get("best_model", "")
+        regression_best = "regression" in best.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=regression_best,
+            detail=(
+                f"verdict.best_model={best!r}" if regression_best
+                else f"verdict.best_model={best!r} (expected NoisyRegression)"
+            ),
+        ))
 
-    # ── Criterion 4: Mentions Climatology as baseline ─────────────────
-    summary_lower = summary_text.lower()
-    climatology_ref = (
-        "climatology" in summary_lower
-        and ("baseline" in summary_lower or "reference" in summary_lower
-             or "benchmark" in summary_lower or "relative" in summary_lower
-             or "compared" in summary_lower or "skill" in summary_lower)
-    )
-    report.criteria.append(CriterionResult(
-        name="identifies_reference",
-        passed=climatology_ref,
-        detail=(
-            "correctly references Climatology baseline" if climatology_ref
-            else "did not mention Climatology as reference/baseline"
-        ),
-    ))
+        # ── Criterion 4: reference_model contains "Climatology" ───────
+        ref = verdict.get("reference_model", "")
+        climatology_ref = "climatology" in ref.lower()
+        report.criteria.append(CriterionResult(
+            name="identifies_reference",
+            passed=climatology_ref,
+            detail=(
+                f"verdict.reference_model={ref!r}" if climatology_ref
+                else f"verdict.reference_model={ref!r} (expected Climatology)"
+            ),
+        ))
+    else:
+        # ── Prose fallback ────────────────────────────────────────────
+        summary_path = output_dir / "agent_summary.txt"
+        summary_text = summary_path.read_text() if summary_path.exists() else ""
+
+        regression_best = _text_contains_positive(summary_text, "regression")
+        if not regression_best:
+            regression_best = _text_contains_positive(summary_text, "noisyregression")
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=regression_best,
+            detail=(
+                "correctly identifies NoisyRegression (prose fallback)"
+                if regression_best
+                else "did not identify NoisyRegression as best (prose fallback)"
+            ),
+        ))
+
+        summary_lower = summary_text.lower()
+        climatology_ref = (
+            "climatology" in summary_lower
+            and ("baseline" in summary_lower or "reference" in summary_lower
+                 or "benchmark" in summary_lower or "relative" in summary_lower
+                 or "compared" in summary_lower or "skill" in summary_lower)
+        )
+        report.criteria.append(CriterionResult(
+            name="identifies_reference",
+            passed=climatology_ref,
+            detail=(
+                "correctly references Climatology baseline (prose fallback)"
+                if climatology_ref
+                else "did not mention Climatology as reference (prose fallback)"
+            ),
+        ))
 
     return report
 
 
-# ── Grader dispatch ────────────────────────────────────────────────────────
+# ── Grader dispatch ──────────────────────────────────────────────────────
 
 GRADERS = {
     "Drug Efficacy Validation": grade_drug_efficacy,

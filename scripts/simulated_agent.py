@@ -1,10 +1,13 @@
 """Simulated agent: follows the Drug Efficacy brief verbatim.
 
 This script represents what a well-functioning AI agent would produce
-when given the agent brief from Lesson 02.  It uses only the public
-DMT API referenced in the brief.
+when given the agent brief.  It uses only the public DMT API
+referenced in the brief.
+
+Lesson 06: writes agent_verdict.json (structured) instead of agent_summary.txt.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -19,12 +22,7 @@ from dmt.scenario.drug_efficacy import (
 
 
 def main(output_dir: str = "./agent_drug_report") -> dict:
-    """Execute the agent brief and return results.
-
-    Returns a dict with:
-        report_path: Path to the generated report
-        summary: The 3-sentence scientific summary
-    """
+    """Execute the agent brief and return results."""
     output_dir = Path(output_dir)
 
     # ── Step 1: Generate observations ─────────────────────────────────
@@ -45,12 +43,10 @@ def main(output_dir: str = "./agent_drug_report") -> dict:
         title="Drug Efficacy Model Comparison",
     )
 
-    # ── Step 4: Read report and write summary ─────────────────────────
+    # ── Step 4: Read report and write structured verdict ──────────────
     report_text = report_path.read_text()
 
     # Parse the Overall Performance table to find best/worst model.
-    # We only read the table between "### Overall Performance" and
-    # the next "##" heading — ignoring the per-group tables.
     best_model = None
     worst_model = None
     best_rmse = float("inf")
@@ -80,32 +76,36 @@ def main(output_dir: str = "./agent_drug_report") -> dict:
                 except (ValueError, IndexError):
                     continue
 
-    summary = (
-        f"The {best_model} model achieves the lowest RMSE ({best_rmse:.2f}), "
-        f"outperforming all other models on the drug efficacy prediction task. "
-        f"The {worst_model} model performs worst because a linear assumption "
-        f"fundamentally fails to capture the sigmoidal dose-response relationship "
-        f"described by Hill equation kinetics. "
-        f"This demonstrates that model structure must match the underlying biology — "
-        f"even a miscalibrated sigmoid outperforms a well-fitted line."
-    )
-
-    # Write summary to file
-    summary_path = output_dir / "agent_summary.txt"
-    summary_path.write_text(summary)
-
-    return {
-        "report_path": str(report_path),
-        "summary": summary,
+    verdict = {
         "best_model": best_model,
+        "best_reason": (
+            f"Achieves the lowest RMSE ({best_rmse:.2f}), "
+            f"outperforming all other models on drug efficacy prediction."
+        ),
         "worst_model": worst_model,
+        "worst_reason": (
+            "A linear assumption fails to capture the sigmoidal "
+            "dose-response relationship described by Hill equation kinetics."
+        ),
+        "reference_model": "LinearModel",
+        "summary": (
+            f"The {best_model} model achieves the lowest RMSE ({best_rmse:.2f}), "
+            f"outperforming all other models on the drug efficacy prediction task. "
+            f"The {worst_model} model performs worst because a linear assumption "
+            f"fundamentally fails to capture the sigmoidal dose-response relationship. "
+            f"Model structure must match the underlying biology."
+        ),
     }
+
+    verdict_path = output_dir / "agent_verdict.json"
+    verdict_path.write_text(json.dumps(verdict, indent=2))
+
+    return verdict
 
 
 if __name__ == "__main__":
     output_dir = sys.argv[1] if len(sys.argv) > 1 else "./agent_drug_report"
     result = main(output_dir)
-    print(f"Report: {result['report_path']}")
     print(f"Best model: {result['best_model']}")
     print(f"Worst model: {result['worst_model']}")
-    print(f"\nSummary:\n{result['summary']}")
+    print(f"\nVerdict written to {output_dir}/agent_verdict.json")

@@ -9,6 +9,18 @@ A brief encodes:
 from dataclasses import dataclass, field
 
 
+VERDICT_SCHEMA_DESCRIPTION = """\
+Write a JSON file called agent_verdict.json to the output directory with these fields:
+{
+  "best_model": "<name of best model>",
+  "best_reason": "<one sentence why>",
+  "worst_model": "<name of worst model>",
+  "worst_reason": "<one sentence why>",
+  "reference_model": "<name of baseline model>",
+  "summary": "<2-3 sentence scientific summary>"
+}"""
+
+
 @dataclass
 class AgentBrief:
     """A machine-readable agent task specification."""
@@ -72,23 +84,22 @@ DRUG_EFFICACY_BRIEF = AgentBrief(
          "observations=obs, scenario=DRUG_EFFICACY, "
          "reference_model=linear, output_dir=OUTPUT_DIR, "
          "title='Drug Efficacy Model Comparison')"),
-        "Read the generated report.md and write a 3-sentence scientific summary to agent_summary.txt",
+        ("Read the generated report.md and write agent_verdict.json "
+         "to the output directory (see verdict_format constraint)"),
     ],
     constraints={
         "reference_model": "Use LinearModel as the reference (baseline) model",
         "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_drug_report/)",
-        "summary_requirements": (
-            "State which model is best, why, and what the key finding is"
-        ),
+        "verdict_format": VERDICT_SCHEMA_DESCRIPTION,
     },
     success_criteria={
-        "report_exists": "The report file exists at ./agent_drug_report/report.md",
+        "report_exists": "The report file exists at the output directory",
         "has_sections": (
             "The report contains Abstract, Methods, Results, Discussion, Conclusion"
         ),
-        "identifies_best": "Summary correctly identifies the Calibrated model as best",
+        "identifies_best": "Verdict correctly identifies the Calibrated model as best",
         "identifies_worst": (
-            "Summary notes that the Linear model fails on sigmoidal data"
+            "Verdict correctly identifies the Linear model as worst"
         ),
     },
 )
@@ -113,14 +124,13 @@ WEATHER_BRIEF = AgentBrief(
          "observations=obs, scenario=WEATHER, "
          "reference_model=climatology, output_dir=OUTPUT_DIR, "
          "title='Weather Prediction Model Comparison')"),
-        "Read the generated report.md and write a 3-sentence scientific summary to agent_summary.txt",
+        ("Read the generated report.md and write agent_verdict.json "
+         "to the output directory (see verdict_format constraint)"),
     ],
     constraints={
         "reference_model": "Use ClimatologyModel as the reference (baseline) model",
         "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_weather_report/)",
-        "summary_requirements": (
-            "State which model is best, why, and what the key finding is"
-        ),
+        "verdict_format": VERDICT_SCHEMA_DESCRIPTION,
     },
     success_criteria={
         "report_exists": "The report file exists at the output directory",
@@ -128,10 +138,10 @@ WEATHER_BRIEF = AgentBrief(
             "The report contains Abstract, Methods, Results, Discussion, Conclusion"
         ),
         "identifies_best": (
-            "Summary identifies NoisyRegression as the best model"
+            "Verdict identifies NoisyRegression as the best model"
         ),
-        "identifies_reference": (
-            "Summary mentions Climatology as the baseline or reference"
+        "identifies_worst": (
+            "Verdict identifies the worst-performing model"
         ),
     },
 )
