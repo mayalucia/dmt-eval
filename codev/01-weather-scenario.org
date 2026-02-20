@@ -1,0 +1,800 @@
+#+title: Lesson 01 — The Weather Scenario
+#+subtitle: End-to-end validation prototype using simulated weather data
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Every validation framework sounds good in the abstract.  The test is whether it
+can produce a /scientific report/ that a domain expert can read and judge.  In
+this lesson we build that test.
+
+We choose weather prediction as our domain — not because we are meteorologists,
+but because the scientific logic is universally accessible:
+
+- Everyone understands "will it be warmer tomorrow?"
+- The metrics (RMSE, bias, skill score) are standard across all of science
+- There are obvious competing "models" with known characteristics
+- The WMO's Weather Prediction Model Intercomparison Project (WP-MIP) is
+  building exactly what DMT provides — we are prototyping it here
+
+** The Scenario
+
+We simulate one year of daily temperature observations for five European cities.
+Three toy models compete to predict these temperatures:
+
+1. *Persistence* — tomorrow's temperature equals today's.  The laziest possible
+   forecast.  Any useful model must beat this.
+
+2. *Climatology* — tomorrow's temperature equals the historical average for that
+   calendar day.  Captures the seasonal cycle but ignores day-to-day weather.
+
+3. *Noisy Regression* — a simple AR(1) model: $T_{t+1} = \alpha T_t + (1-\alpha)
+   \bar{T}_{\text{season}} + \epsilon$.  Blends persistence with climatology,
+   with tunable noise.
+
+The validation question: /which model best predicts temperature, and does the
+answer depend on season or location?/
+
+** What Gets Built
+
+This single org file tangles to:
+
+| File                              | Role                                         |
+|-----------------------------------+----------------------------------------------|
+| =src/dmt/scenario/weather.py=    | Synthetic observations + three toy models    |
+| =src/dmt/adapter.py=             | The =@dmt.adapter= decorator and Protocol    |
+| =src/dmt/measurement.py=         | Metrics: RMSE, bias, skill score             |
+| =src/dmt/document/renderer.py=   | Markdown report renderer                     |
+| =src/dmt/evaluate.py=            | =dmt.evaluate()= — the Level 0 entry point  |
+| =test/test_weather_scenario.py=  | End-to-end test: run scenario, check report  |
+
+** Learning Objectives
+
+- [ ] See DMT's full loop: data → adapter → measurement → report
+- [ ] Understand adapter as the thin bridge between model and analysis
+- [ ] See how =DocumentBuilder= sections get populated with real data
+- [ ] Read a generated LabReport and judge its scientific coherence
+
+
+* The Synthetic World
+
+** Generating Observations
+
+We need a ground truth that is physically plausible but fully under our control.
+Temperature in a mid-latitude city follows a sinusoidal annual cycle perturbed
+by weather noise.  For city $c$ on day $d$:
+
+$$T_c(d) = \bar{T}_c + A_c \sin\!\left(\frac{2\pi(d - \phi_c)}{365}\right) + \epsilon$$
+
+where $\bar{T}_c$ is the annual mean, $A_c$ the seasonal amplitude, $\phi_c$ a
+phase offset (coldest day), and $\epsilon \sim \mathcal{N}(0, \sigma_c^2)$ is
+weather noise.  The autocorrelation of real weather is captured by making $\epsilon$
+an AR(1) process: $\epsilon_t = \rho\,\epsilon_{t-1} + \eta_t$, with $\rho \approx 0.7$.
+
+#+begin_src python :tangle ../src/dmt/scenario/__init__.py
+"""Simulated scenarios for DMT prototyping."""
+#+end_src
+
+#+begin_src python :tangle ../src/dmt/scenario/weather.py
+"""Synthetic weather observations and toy prediction models.
+
+The ground truth is a sinusoidal annual cycle with AR(1) weather noise.
+Three models of increasing sophistication attempt to predict it.
+"""
+
+from dataclasses import dataclass, field
+import numpy as np
+import pandas as pd
+
+# ── City parameters ──────────────────────────────────────────────────────────
+
+CITIES = {
+    "Zurich":    {"mean": 9.3,  "amplitude": 10.5, "phase": 15,  "noise_std": 3.2},
+    "Madrid":    {"mean": 14.5, "amplitude": 10.0, "phase": 20,  "noise_std": 3.5},
+    "Stockholm": {"mean": 6.5,  "amplitude": 13.0, "phase": 10,  "noise_std": 3.8},
+    "Athens":    {"mean": 18.0, "amplitude": 9.0,  "phase": 25,  "noise_std": 2.8},
+    "London":    {"mean": 11.0, "amplitude": 7.5,  "phase": 18,  "noise_std": 2.5},
+}
+
+
+def generate_observations(
+    cities: dict | None = None,
+    n_days: int = 365,
+    ar1_rho: float = 0.7,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Generate synthetic daily temperature observations.
+
+    Returns a DataFrame with columns: city, day, temperature, season.
+    """
+    rng = np.random.default_rng(seed)
+    cities = cities or CITIES
+    rows = []
+    for city, params in cities.items():
+        # Seasonal cycle
+        days = np.arange(n_days)
+        seasonal = (params["mean"]
+                    + params["amplitude"]
+                    * np.sin(2 * np.pi * (days - params["phase"]) / 365))
+        # AR(1) weather noise
+        noise = np.zeros(n_days)
+        noise[0] = rng.normal(0, params["noise_std"])
+        for t in range(1, n_days):
+            noise[t] = (ar1_rho * noise[t - 1]
+                        + np.sqrt(1 - ar1_rho**2)
+                        * rng.normal(0, params["noise_std"]))
+        temperature = seasonal + noise
+        season = pd.cut(
+            days % 365,
+            bins=[0, 90, 181, 273, 365],
+            labels=["winter", "spring", "summer", "autumn"],
+            right=False,
+        )
+        for d in days:
+            rows.append({
+                "city": city,
+                "day": int(d),
+                "temperature": float(temperature[d]),
+                "season": season[d],
+            })
+    return pd.DataFrame(rows)
+
+
+# ── Toy Models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class PersistenceModel:
+    """Tomorrow = today.  The simplest baseline."""
+    name: str = "Persistence"
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        """Predict next-day temperature as current temperature."""
+        predictions = []
+        for city in observations["city"].unique():
+            city_obs = observations[observations["city"] == city].sort_values("day")
+            temps = city_obs["temperature"].values
+            # Shift: prediction for day d+1 is observation at day d
+            pred_temps = np.concatenate([[temps[0]], temps[:-1]])
+            for i, row in enumerate(city_obs.itertuples()):
+                predictions.append({
+                    "city": city,
+                    "day": row.day,
+                    "predicted": float(pred_temps[i]),
+                    "season": row.season,
+                })
+        return pd.DataFrame(predictions)
+
+
+@dataclass
+class ClimatologyModel:
+    """Tomorrow = historical average for this calendar day."""
+    name: str = "Climatology"
+    cities: dict = field(default_factory=lambda: CITIES)
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        """Predict temperature as the seasonal climatological value."""
+        predictions = []
+        for city in observations["city"].unique():
+            params = self.cities[city]
+            city_obs = observations[observations["city"] == city].sort_values("day")
+            for row in city_obs.itertuples():
+                clim = (params["mean"]
+                        + params["amplitude"]
+                        * np.sin(2 * np.pi * (row.day - params["phase"]) / 365))
+                predictions.append({
+                    "city": city,
+                    "day": row.day,
+                    "predicted": float(clim),
+                    "season": row.season,
+                })
+        return pd.DataFrame(predictions)
+
+
+@dataclass
+class NoisyRegressionModel:
+    """AR(1) blend: alpha * today + (1-alpha) * climatology + noise."""
+    name: str = "NoisyRegression"
+    alpha: float = 0.6
+    noise_std: float = 1.0
+    cities: dict = field(default_factory=lambda: CITIES)
+    seed: int = 123
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        """Predict via AR(1) blending of persistence and climatology."""
+        rng = np.random.default_rng(self.seed)
+        predictions = []
+        for city in observations["city"].unique():
+            params = self.cities[city]
+            city_obs = observations[observations["city"] == city].sort_values("day")
+            temps = city_obs["temperature"].values
+            for i, row in enumerate(city_obs.itertuples()):
+                clim = (params["mean"]
+                        + params["amplitude"]
+                        * np.sin(2 * np.pi * (row.day - params["phase"]) / 365))
+                if i == 0:
+                    pred = clim
+                else:
+                    pred = (self.alpha * temps[i - 1]
+                            + (1 - self.alpha) * clim
+                            + rng.normal(0, self.noise_std))
+                predictions.append({
+                    "city": city,
+                    "day": row.day,
+                    "predicted": float(pred),
+                    "season": row.season,
+                })
+        return pd.DataFrame(predictions)
+#+end_src
+
+The three models form a natural hierarchy of skill.  Persistence captures
+day-to-day autocorrelation but misses the seasonal trend.  Climatology
+captures the season but ignores yesterday.  NoisyRegression blends both.
+The validation should quantify this hierarchy — and reveal where it breaks
+down (e.g., persistence may win in stable summer weather).
+
+
+* The Adapter Layer
+
+In DMT's philosophy, an analysis never touches a model directly.  It speaks
+through an /adapter/ — a thin Protocol that declares what measurements are
+possible.  The adapter author (often the modeller) writes the glue.
+
+For weather validation, the contract is simple: given observations, produce
+predictions in the same shape.
+
+#+begin_src python :tangle ../src/dmt/adapter.py
+"""Model adapter infrastructure.
+
+An adapter is any object that satisfies a ``typing.Protocol`` declaring the
+measurements a validation needs.  The ``@adapter`` decorator is syntactic
+sugar that registers an adapter class in a global registry.
+"""
+
+from typing import Protocol, runtime_checkable
+
+import pandas as pd
+
+
+@runtime_checkable
+class WeatherAdapter(Protocol):
+    """Contract for weather model adapters.
+
+    Any object with a ``.predict(observations) -> DataFrame`` method
+    and a ``.name`` attribute satisfies this protocol.
+    """
+    name: str
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        """Return predictions aligned with the observation DataFrame.
+
+        The returned DataFrame must have columns:
+        city, day, predicted, season.
+        """
+        ...
+
+
+def adapt(model) -> WeatherAdapter:
+    """Validate that *model* satisfies the WeatherAdapter protocol.
+
+    Our toy models already satisfy it by construction — their ``.predict()``
+    and ``.name`` attributes match.  For real models you would write a wrapper.
+    """
+    if not isinstance(model, WeatherAdapter):
+        raise TypeError(
+            f"{type(model).__name__} does not satisfy WeatherAdapter: "
+            f"needs .name and .predict(observations) -> DataFrame"
+        )
+    return model
+#+end_src
+
+Note the elegant consequence: our three toy models already satisfy
+=WeatherAdapter= without modification.  =PersistenceModel=, =ClimatologyModel=,
+and =NoisyRegressionModel= each have =.name= and =.predict()=.  The adapter
+layer imposes /no code overhead/ on models that are already well-structured.
+This is the adapter pattern working as intended — the cost is zero when the
+model is clean, and the benefit is a formal contract when it isn't.
+
+
+* Measurement: The Scientific Metrics
+
+A measurement in DMT is a function that takes aligned (observed, predicted)
+data and returns a scalar or a structured result.  We implement the three
+standard forecast verification metrics:
+
+- *RMSE* (Root Mean Square Error): overall accuracy.  Lower is better.
+- *Bias*: systematic over/under-prediction.  Zero is perfect.
+- *Skill Score*: improvement over a reference forecast (climatology).
+  1.0 = perfect, 0.0 = no better than reference, negative = worse.
+
+#+begin_src python :tangle ../src/dmt/measurement.py
+"""Measurement functions for forecast verification.
+
+Each measurement takes a merged DataFrame with 'temperature' (observed)
+and 'predicted' columns, and returns a scalar metric value.
+"""
+
+import numpy as np
+import pandas as pd
+
+
+def rmse(df: pd.DataFrame) -> float:
+    """Root Mean Square Error between observed and predicted."""
+    return float(np.sqrt(np.mean((df["temperature"] - df["predicted"]) ** 2)))
+
+
+def bias(df: pd.DataFrame) -> float:
+    """Mean bias (predicted - observed).  Positive = warm bias."""
+    return float(np.mean(df["predicted"] - df["temperature"]))
+
+
+def skill_score(df: pd.DataFrame, reference_rmse: float) -> float:
+    """Skill score relative to a reference forecast.
+
+    SS = 1 - RMSE_model / RMSE_reference.
+    Positive means the model beats the reference.
+    """
+    model_rmse = rmse(df)
+    if reference_rmse == 0:
+        return 0.0
+    return float(1.0 - model_rmse / reference_rmse)
+
+
+def compute_metrics(
+    observations: pd.DataFrame,
+    predictions: pd.DataFrame,
+    reference_rmse: float | None = None,
+) -> dict:
+    """Compute all verification metrics for a single model.
+
+    Parameters
+    ----------
+    observations : DataFrame with city, day, temperature, season
+    predictions : DataFrame with city, day, predicted, season
+    reference_rmse : RMSE of the reference forecast (for skill score)
+
+    Returns a dict of metric_name -> value.
+    """
+    merged = observations.merge(predictions, on=["city", "day", "season"])
+    result = {
+        "rmse": rmse(merged),
+        "bias": bias(merged),
+    }
+    if reference_rmse is not None:
+        result["skill_score"] = skill_score(merged, reference_rmse)
+    return result
+
+
+def compute_metrics_by_group(
+    observations: pd.DataFrame,
+    predictions: pd.DataFrame,
+    group_by: str = "city",
+    reference_rmse: float | None = None,
+) -> pd.DataFrame:
+    """Compute metrics broken down by a grouping variable.
+
+    Returns a DataFrame with one row per group, columns for each metric.
+    """
+    merged = observations.merge(predictions, on=["city", "day", "season"])
+    rows = []
+    for group_val, group_df in merged.groupby(group_by):
+        row = {group_by: group_val}
+        row["rmse"] = rmse(group_df)
+        row["bias"] = bias(group_df)
+        if reference_rmse is not None:
+            row["skill_score"] = skill_score(group_df, reference_rmse)
+        row["n"] = len(group_df)
+        rows.append(row)
+    return pd.DataFrame(rows)
+#+end_src
+
+
+* The Report Renderer
+
+The =DocumentBuilder= from Lesson 00 accumulates section declarations.  Now we
+need something that /executes/ those sections — calls the registered functions,
+collects their outputs, and renders a Markdown document.
+
+This is deliberately minimal.  A full implementation would use Jinja2 templates,
+produce HTML/PDF, and support multiple report formats.  For the prototype, plain
+Markdown is enough to prove the concept.
+
+#+begin_src python :tangle ../src/dmt/document/renderer.py
+"""Render a populated DocumentBuilder to Markdown.
+
+This is the minimal viable renderer — proof that DMT can produce
+structured scientific documents from decorator-accumulated sections.
+"""
+
+from pathlib import Path
+from collections import OrderedDict
+
+import pandas as pd
+
+
+def render_markdown(title: str, sections: OrderedDict, output_dir: str | Path) -> Path:
+    """Render sections to a Markdown file.
+
+    Parameters
+    ----------
+    title : str
+        Document title.
+    sections : OrderedDict
+        label -> dict with keys: narrative (str), data (DataFrame or None),
+        illustration (str path or None).
+    output_dir : path
+        Directory to write the report into.
+
+    Returns the path to the generated .md file.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    lines = [f"# {title}\n"]
+
+    for label, content in sections.items():
+        section_name = content.get("name", label.replace("_", " ").title())
+        lines.append(f"\n## {section_name}\n")
+
+        if content.get("narrative"):
+            lines.append(content["narrative"])
+            lines.append("")
+
+        if content.get("data") is not None:
+            df = content["data"]
+            if isinstance(df, pd.DataFrame):
+                lines.append(df.to_markdown(index=False))
+                lines.append("")
+                # Also save CSV
+                csv_path = output_dir / f"{label}.csv"
+                df.to_csv(csv_path, index=False)
+
+        if content.get("illustration"):
+            ill = content["illustration"]
+            lines.append(f"![{section_name}]({ill})")
+            lines.append("")
+
+    report_path = output_dir / "report.md"
+    report_path.write_text("\n".join(lines))
+    return report_path
+#+end_src
+
+
+* The Evaluator: Closing the Loop
+
+This is the module that ties everything together.  =evaluate()= is DMT's
+Level 0 entry point — the function you call with models, data, and metrics,
+and get back a structured report.
+
+#+begin_src python :tangle ../src/dmt/evaluate.py
+"""The Level 0 entry point: dmt.evaluate().
+
+Takes models + observations, runs measurements, produces a LabReport.
+"""
+
+from collections import OrderedDict
+from pathlib import Path
+
+import pandas as pd
+
+from dmt.measurement import compute_metrics, compute_metrics_by_group
+from dmt.document.renderer import render_markdown
+
+
+def evaluate(
+    models: list,
+    observations: pd.DataFrame,
+    reference_model=None,
+    group_by: str = "city",
+    output_dir: str | Path = "./dmt_report",
+    title: str = "Model Evaluation Report",
+) -> Path:
+    """Evaluate models against observations and produce a LabReport.
+
+    Parameters
+    ----------
+    models : list of model objects
+        Each must have .name (str) and .predict(observations) -> DataFrame.
+    observations : DataFrame
+        Ground truth with columns: city, day, temperature, season.
+    reference_model : optional
+        Model to use as baseline for skill scores.  If None, uses the
+        first model in the list.
+    group_by : str
+        Column to break down metrics by (default: "city").
+    output_dir : path
+        Where to write the report.
+    title : str
+        Report title.
+
+    Returns the path to the generated report.
+    """
+    reference = reference_model or models[0]
+    ref_predictions = reference.predict(observations)
+    ref_merged = observations.merge(ref_predictions, on=["city", "day", "season"])
+    from dmt.measurement import rmse as _rmse
+    reference_rmse = _rmse(ref_merged)
+
+    # ── Run all models ──────────────────────────────────────────────────
+    all_summary = []
+    all_by_group = {}
+    all_by_season = {}
+
+    for model in models:
+        predictions = model.predict(observations)
+        summary = compute_metrics(observations, predictions, reference_rmse)
+        summary["model"] = model.name
+        all_summary.append(summary)
+
+        by_group = compute_metrics_by_group(
+            observations, predictions, group_by, reference_rmse)
+        by_group["model"] = model.name
+        all_by_group[model.name] = by_group
+
+        by_season = compute_metrics_by_group(
+            observations, predictions, "season", reference_rmse)
+        by_season["model"] = model.name
+        all_by_season[model.name] = by_season
+
+    summary_df = pd.DataFrame(all_summary)[["model", "rmse", "bias", "skill_score"]]
+    grouped_df = pd.concat(all_by_group.values(), ignore_index=True)
+    season_df = pd.concat(all_by_season.values(), ignore_index=True)
+
+    # ── Assemble the LabReport sections ─────────────────────────────────
+    sections = OrderedDict()
+
+    sections["abstract"] = {
+        "name": "Abstract",
+        "narrative": (
+            f"We evaluate {len(models)} weather prediction models against "
+            f"synthetic daily temperature observations for "
+            f"{observations['city'].nunique()} European cities over "
+            f"{observations['day'].nunique()} days.  "
+            f"Models are compared using RMSE, bias, and skill score "
+            f"(relative to {reference.name}).  "
+            f"Results are broken down by {group_by} and by season."
+        ),
+    }
+
+    sections["introduction"] = {
+        "name": "Introduction",
+        "narrative": (
+            "Weather prediction is a canonical test bed for model comparison.  "
+            "Given the same set of observations, different forecasting strategies "
+            "trade off between capturing the seasonal cycle (climatological skill) "
+            "and tracking day-to-day variability (persistence skill).  "
+            "A useful model must outperform naive baselines on metrics that matter "
+            "to the end user.\n\n"
+            "This report compares:\n\n"
+            + "\n".join(f"- **{m.name}**" for m in models)
+        ),
+    }
+
+    sections["methods"] = {
+        "name": "Methods",
+        "narrative": (
+            "**Observations**: Synthetic daily temperature generated from a "
+            "sinusoidal annual cycle with AR(1) autocorrelated weather noise "
+            "(rho=0.7).  City-specific parameters for mean temperature, "
+            "seasonal amplitude, and noise standard deviation.\n\n"
+            "**Metrics**:\n\n"
+            "- *RMSE*: Root mean square error (degrees C).  Lower is better.\n"
+            "- *Bias*: Mean (predicted - observed).  Zero is unbiased.\n"
+            f"- *Skill Score*: 1 - RMSE_model / RMSE_{reference.name}.  "
+            "Positive means the model beats the reference.\n\n"
+            f"**Grouping**: Results are stratified by {group_by} and by season."
+        ),
+    }
+
+    sections["results"] = {
+        "name": "Results",
+        "narrative": "### Overall Performance",
+        "data": summary_df,
+    }
+
+    sections["results_by_city"] = {
+        "name": f"Results by {group_by.title()}",
+        "narrative": (
+            f"Performance broken down by {group_by} reveals geographic "
+            "variation in model skill."
+        ),
+        "data": grouped_df,
+    }
+
+    sections["results_by_season"] = {
+        "name": "Results by Season",
+        "narrative": (
+            "Seasonal stratification tests whether model skill depends "
+            "on the time of year."
+        ),
+        "data": season_df,
+    }
+
+    # ── Find best model per group ──────────────────────────────────────
+    best_overall = summary_df.loc[summary_df["rmse"].idxmin(), "model"]
+    discussion_parts = [
+        f"**{best_overall}** achieves the lowest overall RMSE.\n",
+    ]
+    for season in ["winter", "spring", "summer", "autumn"]:
+        season_data = season_df[season_df["season"] == season]
+        if not season_data.empty:
+            best = season_data.loc[season_data["rmse"].idxmin(), "model"]
+            discussion_parts.append(f"- *{season.title()}*: best model is **{best}**")
+
+    sections["discussion"] = {
+        "name": "Discussion",
+        "narrative": "\n".join(discussion_parts),
+    }
+
+    sections["conclusion"] = {
+        "name": "Conclusion",
+        "narrative": (
+            f"The evaluation demonstrates DMT's end-to-end capability: "
+            f"three models were compared against synthetic observations, "
+            f"metrics computed with geographic and seasonal stratification, "
+            f"and this structured report generated automatically.  "
+            f"The same pattern applies to any domain — LLMs, drug discovery, "
+            f"financial models — by swapping the adapter and metrics."
+        ),
+    }
+
+    return render_markdown(title, sections, output_dir)
+#+end_src
+
+
+* The End-to-End Test
+
+This is the test you run to see it all work.  It generates observations,
+runs three models, produces a LabReport, and verifies the report exists
+and contains the expected sections.
+
+#+begin_src python :tangle ../test/test_weather_scenario.py
+"""End-to-end test: generate weather scenario, evaluate models, produce report."""
+
+from pathlib import Path
+import shutil
+
+from dmt.scenario.weather import (
+    generate_observations,
+    PersistenceModel,
+    ClimatologyModel,
+    NoisyRegressionModel,
+)
+from dmt.adapter import adapt
+from dmt.evaluate import evaluate
+
+
+def test_weather_scenario(tmp_path):
+    """Full pipeline: observations -> models -> adapter -> evaluate -> report."""
+    # 1. Generate synthetic observations
+    obs = generate_observations(n_days=365, seed=42)
+    assert len(obs) == 5 * 365  # 5 cities, 365 days
+    assert set(obs.columns) == {"city", "day", "temperature", "season"}
+
+    # 2. Create models
+    persistence = PersistenceModel()
+    climatology = ClimatologyModel()
+    regression = NoisyRegressionModel(alpha=0.7, noise_std=0.5)
+
+    # 3. Verify adapter protocol
+    for model in [persistence, climatology, regression]:
+        adapted = adapt(model)
+        assert adapted.name
+
+    # 4. Run evaluation
+    report_dir = tmp_path / "weather_report"
+    report_path = evaluate(
+        models=[persistence, climatology, regression],
+        observations=obs,
+        reference_model=climatology,
+        output_dir=report_dir,
+        title="Weather Prediction Model Comparison",
+    )
+
+    # 5. Verify report was generated
+    assert report_path.exists()
+    report_text = report_path.read_text()
+
+    # 6. Verify report structure
+    assert "# Weather Prediction Model Comparison" in report_text
+    assert "## Abstract" in report_text
+    assert "## Introduction" in report_text
+    assert "## Methods" in report_text
+    assert "## Results" in report_text
+    assert "## Discussion" in report_text
+    assert "## Conclusion" in report_text
+
+    # 7. Verify all models appear in results
+    assert "Persistence" in report_text
+    assert "Climatology" in report_text
+    assert "NoisyRegression" in report_text
+
+    # 8. Verify CSV data was saved
+    assert (report_dir / "results.csv").exists()
+    assert (report_dir / "results_by_city.csv").exists()
+    assert (report_dir / "results_by_season.csv").exists()
+
+
+def test_regression_beats_persistence():
+    """The AR(1) blend should outperform naive persistence overall."""
+    obs = generate_observations(n_days=365, seed=42)
+
+    from dmt.measurement import compute_metrics
+    persistence = PersistenceModel()
+    regression = NoisyRegressionModel(alpha=0.7, noise_std=0.5)
+
+    p_metrics = compute_metrics(obs, persistence.predict(obs))
+    r_metrics = compute_metrics(obs, regression.predict(obs))
+
+    assert r_metrics["rmse"] < p_metrics["rmse"], (
+        f"Regression RMSE ({r_metrics['rmse']:.2f}) should be less than "
+        f"Persistence RMSE ({p_metrics['rmse']:.2f})"
+    )
+
+
+def test_climatology_is_unbiased():
+    """Climatology predictions should have near-zero bias."""
+    obs = generate_observations(n_days=365, seed=42)
+
+    from dmt.measurement import compute_metrics
+    climatology = ClimatologyModel()
+    metrics = compute_metrics(obs, climatology.predict(obs))
+
+    assert abs(metrics["bias"]) < 0.5, (
+        f"Climatology bias ({metrics['bias']:.3f}) should be near zero"
+    )
+#+end_src
+
+
+* Running It
+
+To see the report:
+
+#+begin_example
+  cd ~/Darshan/research/develop/agentic/dmt-eval
+  make tangle
+  uv run --extra dev python -c "
+from dmt.scenario.weather import *
+from dmt.evaluate import evaluate
+
+obs = generate_observations()
+report = evaluate(
+    models=[PersistenceModel(), ClimatologyModel(), NoisyRegressionModel(alpha=0.7, noise_std=0.5)],
+    observations=obs,
+    reference_model=ClimatologyModel(),
+    title='Weather Prediction Model Comparison',
+)
+print(f'Report at: {report}')
+print()
+print(report.read_text())
+"
+#+end_example
+
+
+* Requirements for Agents                                        :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 01-weather-scenario
+tag: lesson/01-weather-scenario
+depends_on: 00-document-builder
+files_created:
+  - src/dmt/scenario/__init__.py
+  - src/dmt/scenario/weather.py
+  - src/dmt/adapter.py
+  - src/dmt/measurement.py
+  - src/dmt/document/renderer.py
+  - src/dmt/evaluate.py
+  - test/test_weather_scenario.py
+verification:
+  - "uv run --extra dev pytest test/test_weather_scenario.py -v — all tests pass"
+  - "the generated report.md contains Abstract, Introduction, Methods, Results, Discussion, Conclusion"
+  - "NoisyRegression has the lowest RMSE"
+next_lesson: 02-agent-evaluation
+#+end_src
+
+* Local Variables                                                :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:
