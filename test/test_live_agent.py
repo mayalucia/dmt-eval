@@ -4,6 +4,7 @@ This is DMT testing itself: the framework is the model, the agent's
 success/failure is the data, and the grading criteria are the test.
 
 Lesson 06: updated to expect agent_verdict.json instead of agent_summary.txt.
+Lesson 07: total_count is now 5 (added verdict_valid criterion).
 """
 
 from pathlib import Path
@@ -62,7 +63,7 @@ def test_grade_report_structure(tmp_path):
     grade = grade_drug_efficacy(output_dir)
 
     assert grade.agent_name == "Drug Efficacy Validation"
-    assert grade.total_count == 4
+    assert grade.total_count == 5  # report, sections, verdict_valid, best, worst
     assert grade.score == 1.0
     assert "PASS" in grade.summary()
     assert "FAIL" not in grade.summary()

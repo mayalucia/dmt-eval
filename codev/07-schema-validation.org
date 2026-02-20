@@ -1,0 +1,1231 @@
+#+title: Lesson 07 — Schema Validation
+#+subtitle: Catching malformed verdicts before grading
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Lesson 06 introduced =agent_verdict.json= — agents write structured JSON
+instead of prose, and the grader checks fields directly.  But there's a gap
+between "the file exists" and "the file is correct":
+
+1. *Missing fields*.  A weaker LLM might write ={"best_model": "X"}= and
+   omit =worst_model=.  The grader silently gets an empty string from
+   =verdict.get("worst_model", "")=, which fails the criterion — but the
+   error message says "expected Linear" rather than "field missing".
+
+2. *Wrong types*.  An LLM might write ={"best_model": 42}= or
+   ={"summary": null}=.  The grader compares =42.lower()= and crashes.
+
+3. *Extra garbage*.  The JSON might parse but contain unexpected structure.
+   The grader ignores it, but we lose the signal that the agent
+   misunderstood the schema.
+
+4. *Not even JSON*.  The agent writes prose into =agent_verdict.json=.
+   Currently =_load_verdict= silently falls back to prose — losing the
+   diagnostic that the agent /tried/ to write JSON but failed.
+
+The fix: validate the verdict against the schema /before/ grading.  A
+=validate_verdict= function checks required fields and types, producing a
+=ValidationResult= with specific error messages.  The grader adds a new
+=verdict_valid= criterion that tells the agent author exactly what went wrong.
+
+#+begin_example
+  agent_verdict.json                  ValidationResult
+  ──────────────────                  ────────────────────
+  {"best_model": "X"}    ──────────> valid=False
+                                     errors=["missing: worst_model",
+                                             "missing: worst_reason",
+                                             "missing: reference_model",
+                                             "missing: summary"]
+
+  {"best_model": 42,     ──────────> valid=False
+   ...all fields...}                 errors=["best_model: expected str, got int"]
+
+  {all correct}          ──────────> valid=True, errors=[]
+#+end_example
+
+No new dependencies.  Six required string fields don't justify Pydantic or
+jsonschema — a 20-line validator is cleaner and more transparent.
+
+** File Map
+
+| File                                 | Change                                   |
+|--------------------------------------+------------------------------------------|
+| =src/dmt/agent/verdict.py=          | + =validate_verdict()=, =ValidationResult= |
+| =src/dmt/agent/grader.py=           | Uses validation; adds =verdict_valid= criterion |
+| =test/test_schema_validation.py=    | Tests for validation + grading integration |
+
+
+* The Validator
+
+The validator is a pure function: =dict -> ValidationResult=.  It checks
+required fields, types, and non-emptiness.  It does /not/ check domain
+correctness (that's the grader's job) — only structural validity.
+
+#+begin_src python :tangle ../src/dmt/agent/verdict.py
+"""Structured agent verdict — the JSON output schema.
+
+Instead of prose summaries, agents write a JSON file with explicit fields.
+The grader checks field values directly — no keyword matching.
+
+Lesson 07: schema validation before grading.
+"""
+
+import json
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+
+VERDICT_FILENAME = "agent_verdict.json"
+
+# Required fields and their expected types
+REQUIRED_FIELDS: dict[str, type] = {
+    "best_model": str,
+    "best_reason": str,
+    "worst_model": str,
+    "worst_reason": str,
+    "reference_model": str,
+    "summary": str,
+}
+
+
+@dataclass
+class ValidationResult:
+    """Result of validating a verdict against the schema."""
+    valid: bool
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if self.valid:
+            return "verdict valid"
+        return "verdict invalid: " + "; ".join(self.errors)
+
+
+def validate_verdict(data: dict) -> ValidationResult:
+    """Validate a parsed verdict dict against the schema.
+
+    Checks:
+    - All required fields are present
+    - All required fields are non-empty strings
+    - No type violations
+
+    Does NOT check domain correctness (e.g. whether best_model is
+    actually the best).  That's the grader's job.
+    """
+    errors = []
+
+    for field_name, expected_type in REQUIRED_FIELDS.items():
+        if field_name not in data:
+            errors.append(f"missing: {field_name}")
+            continue
+
+        value = data[field_name]
+        if not isinstance(value, expected_type):
+            actual = type(value).__name__
+            errors.append(
+                f"{field_name}: expected {expected_type.__name__}, got {actual}"
+            )
+        elif isinstance(value, str) and not value.strip():
+            errors.append(f"{field_name}: empty string")
+
+    return ValidationResult(valid=len(errors) == 0, errors=errors)
+
+
+@dataclass
+class AgentVerdict:
+    """Structured verdict from an agent run.
+
+    Fields
+    ------
+    best_model : str
+        Name of the model the agent considers best.
+    best_reason : str
+        One-sentence justification.
+    worst_model : str
+        Name of the worst-performing model.
+    worst_reason : str
+        One-sentence explanation of the failure mode.
+    reference_model : str
+        The baseline / reference model used.
+    summary : str
+        A 2–3 sentence scientific summary (still useful for humans).
+    extra : dict
+        Domain-specific extras the grader may inspect.
+    """
+    best_model: str
+    best_reason: str
+    worst_model: str
+    worst_reason: str
+    reference_model: str
+    summary: str
+    extra: dict = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        """Serialize to a JSON string."""
+        return json.dumps(asdict(self), indent=2)
+
+    def save(self, output_dir: str | Path) -> Path:
+        """Write to agent_verdict.json in the given directory."""
+        path = Path(output_dir) / VERDICT_FILENAME
+        path.write_text(self.to_json())
+        return path
+
+    @classmethod
+    def load(cls, output_dir: str | Path) -> "AgentVerdict":
+        """Read from agent_verdict.json.
+
+        Raises FileNotFoundError if the file doesn't exist.
+        Raises json.JSONDecodeError or KeyError on malformed JSON.
+        """
+        path = Path(output_dir) / VERDICT_FILENAME
+        data = json.loads(path.read_text())
+        return cls(
+            best_model=data["best_model"],
+            best_reason=data["best_reason"],
+            worst_model=data["worst_model"],
+            worst_reason=data["worst_reason"],
+            reference_model=data["reference_model"],
+            summary=data["summary"],
+            extra=data.get("extra", {}),
+        )
+
+    @classmethod
+    def load_validated(cls, output_dir: str | Path) -> tuple["AgentVerdict | None", ValidationResult]:
+        """Load and validate in one step.
+
+        Returns (verdict, validation_result).
+        If the file doesn't exist or isn't valid JSON, returns (None, result_with_errors).
+        If schema validation fails, returns (None, result_with_errors).
+        If valid, returns (verdict, result_ok).
+        """
+        path = Path(output_dir) / VERDICT_FILENAME
+        if not path.exists():
+            return None, ValidationResult(valid=False, errors=["file not found"])
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            return None, ValidationResult(valid=False, errors=[f"invalid JSON: {e}"])
+
+        if not isinstance(data, dict):
+            return None, ValidationResult(
+                valid=False, errors=[f"expected JSON object, got {type(data).__name__}"]
+            )
+
+        result = validate_verdict(data)
+        if not result.valid:
+            return None, result
+
+        verdict = cls(
+            best_model=data["best_model"],
+            best_reason=data["best_reason"],
+            worst_model=data["worst_model"],
+            worst_reason=data["worst_reason"],
+            reference_model=data["reference_model"],
+            summary=data["summary"],
+            extra=data.get("extra", {}),
+        )
+        return verdict, result
+#+end_src
+
+
+* Updated Grader — Validation as a Criterion
+
+The grader now uses =load_validated= instead of the raw =_load_verdict=.
+When the verdict file exists but is invalid, the grader produces a
+=verdict_valid= criterion with the specific errors.  This gives the agent
+author (or the tournament operator) clear diagnostics.
+
+The grading flow becomes:
+
+#+begin_example
+  1. report.md exists?         → criterion: report_exists
+  2. has required sections?    → criterion: has_sections
+  3. agent_verdict.json valid? → criterion: verdict_valid (NEW)
+     ├── valid:   check fields → criteria: identifies_best, identifies_worst
+     ├── invalid: fail + msg   → criteria fail with validation errors
+     └── absent:  prose path   → criteria via keyword matching (fallback)
+#+end_example
+
+#+begin_src python :tangle ../src/dmt/agent/grader.py
+"""Grade an agent's output against success criteria.
+
+Lesson 06: structured JSON verdict is the primary grading path.
+Lesson 07: schema validation before grading.
+Falls back to prose keyword matching if agent_verdict.json is absent.
+"""
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dmt.agent.verdict import validate_verdict, ValidationResult, VERDICT_FILENAME
+
+
+@dataclass
+class CriterionResult:
+    """Result of evaluating a single success criterion."""
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass
+class GradeReport:
+    """Full grading report for an agent run."""
+    agent_name: str
+    criteria: list[CriterionResult] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        return all(c.passed for c in self.criteria)
+
+    @property
+    def pass_count(self) -> int:
+        return sum(1 for c in self.criteria if c.passed)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.criteria)
+
+    @property
+    def score(self) -> float:
+        if not self.criteria:
+            return 0.0
+        return self.pass_count / self.total_count
+
+    def summary(self) -> str:
+        lines = [
+            f"Agent: {self.agent_name}",
+            f"Score: {self.pass_count}/{self.total_count} "
+            f"({self.score:.0%})",
+            "",
+        ]
+        for c in self.criteria:
+            mark = "PASS" if c.passed else "FAIL"
+            lines.append(f"  [{mark}] {c.name}: {c.detail}")
+        return "\n".join(lines)
+
+
+# ── Verdict loading + validation ─────────────────────────────────────────
+
+def _load_and_validate_verdict(output_dir: Path) -> tuple[dict | None, ValidationResult | None]:
+    """Load and validate agent_verdict.json.
+
+    Returns (parsed_dict, validation_result).
+    - If file doesn't exist: (None, None) — triggers prose fallback.
+    - If file exists but invalid JSON: (None, ValidationResult with errors).
+    - If file exists, valid JSON, but bad schema: (dict, ValidationResult with errors).
+    - If file exists and schema-valid: (dict, ValidationResult ok).
+    """
+    verdict_path = output_dir / VERDICT_FILENAME
+    if not verdict_path.exists():
+        return None, None
+
+    try:
+        data = json.loads(verdict_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        return None, ValidationResult(valid=False, errors=[f"invalid JSON: {e}"])
+
+    if not isinstance(data, dict):
+        return None, ValidationResult(
+            valid=False,
+            errors=[f"expected JSON object, got {type(data).__name__}"]
+        )
+
+    result = validate_verdict(data)
+    return data, result
+
+
+# ── Prose fallback (kept for backward compatibility) ─────────────────────
+
+_POSITIVE_WORDS = frozenset({
+    "best", "lowest", "superior", "outperform", "outperforms",
+    "highest accuracy", "top", "winner", "strongest",
+})
+
+_NEGATIVE_WORDS = frozenset({
+    "worst", "fails", "failure", "poor", "poorest",
+    "highest rmse", "cannot capture", "inadequate",
+})
+
+
+def _text_contains_positive(text: str, entity: str) -> bool:
+    """Check if text positively identifies entity as the best."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _POSITIVE_WORDS)
+
+
+def _text_contains_negative(text: str, entity: str) -> bool:
+    """Check if text negatively identifies entity's limitations."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _NEGATIVE_WORDS)
+
+
+# ── Report section checker (shared) ─────────────────────────────────────
+
+def _check_report_sections(report_text: str) -> CriterionResult:
+    """Check that the report has all required sections."""
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    return CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    )
+
+
+# ── Domain-specific graders ──────────────────────────────────────────────
+
+def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's drug efficacy validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Drug Efficacy Validation")
+    report_path = output_dir / "report.md"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "verdict_valid", "identifies_best", "identifies_worst"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    report.criteria.append(_check_report_sections(report_text))
+
+    # ── Load and validate verdict ─────────────────────────────────────
+    verdict, validation = _load_and_validate_verdict(output_dir)
+
+    if validation is not None:
+        # File existed — report validation result
+        report.criteria.append(CriterionResult(
+            name="verdict_valid",
+            passed=validation.valid,
+            detail=validation.summary(),
+        ))
+
+        if validation.valid:
+            # ── Criterion 4: best_model == "CalibratedModel" ─────────
+            best = verdict.get("best_model", "")
+            calibrated_best = "calibrat" in best.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=calibrated_best,
+                detail=(
+                    f"verdict.best_model={best!r}" if calibrated_best
+                    else f"verdict.best_model={best!r} (expected Calibrated)"
+                ),
+            ))
+
+            # ── Criterion 5: worst_model == "LinearModel" ────────────
+            worst = verdict.get("worst_model", "")
+            linear_worst = "linear" in worst.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_worst",
+                passed=linear_worst,
+                detail=(
+                    f"verdict.worst_model={worst!r}" if linear_worst
+                    else f"verdict.worst_model={worst!r} (expected Linear)"
+                ),
+            ))
+        else:
+            # Schema invalid — domain criteria auto-fail with diagnostic
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
+            report.criteria.append(CriterionResult(
+                name="identifies_worst",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
+    else:
+        # ── Prose fallback (no verdict file) ──────────────────────────
+        summary_path = output_dir / "agent_summary.txt"
+        summary_text = summary_path.read_text() if summary_path.exists() else ""
+
+        calibrated_best = _text_contains_positive(summary_text, "calibrated")
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=calibrated_best,
+            detail=(
+                "correctly identifies Calibrated (prose fallback)"
+                if calibrated_best
+                else "did not identify Calibrated as best model (prose fallback)"
+            ),
+        ))
+
+        linear_fails = _text_contains_negative(summary_text, "linear")
+        summary_lower = summary_text.lower()
+        if not linear_fails:
+            linear_fails = (
+                "linear" in summary_lower
+                and ("sigmoid" in summary_lower or "hill" in summary_lower)
+            )
+        report.criteria.append(CriterionResult(
+            name="identifies_worst",
+            passed=linear_fails,
+            detail=(
+                "correctly notes Linear failure (prose fallback)"
+                if linear_fails
+                else "did not identify Linear as worst (prose fallback)"
+            ),
+        ))
+
+    return report
+
+
+def grade_weather(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's weather prediction validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Weather Prediction Validation")
+    report_path = output_dir / "report.md"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "verdict_valid", "identifies_best", "identifies_reference"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    report.criteria.append(_check_report_sections(report_text))
+
+    # ── Load and validate verdict ─────────────────────────────────────
+    verdict, validation = _load_and_validate_verdict(output_dir)
+
+    if validation is not None:
+        # File existed — report validation result
+        report.criteria.append(CriterionResult(
+            name="verdict_valid",
+            passed=validation.valid,
+            detail=validation.summary(),
+        ))
+
+        if validation.valid:
+            # ── Criterion 4: best_model contains "Regression" ─────────
+            best = verdict.get("best_model", "")
+            regression_best = "regression" in best.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=regression_best,
+                detail=(
+                    f"verdict.best_model={best!r}" if regression_best
+                    else f"verdict.best_model={best!r} (expected NoisyRegression)"
+                ),
+            ))
+
+            # ── Criterion 5: reference_model contains "Climatology" ───
+            ref = verdict.get("reference_model", "")
+            climatology_ref = "climatology" in ref.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_reference",
+                passed=climatology_ref,
+                detail=(
+                    f"verdict.reference_model={ref!r}" if climatology_ref
+                    else f"verdict.reference_model={ref!r} (expected Climatology)"
+                ),
+            ))
+        else:
+            # Schema invalid — domain criteria auto-fail with diagnostic
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
+            report.criteria.append(CriterionResult(
+                name="identifies_reference",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
+    else:
+        # ── Prose fallback (no verdict file) ──────────────────────────
+        summary_path = output_dir / "agent_summary.txt"
+        summary_text = summary_path.read_text() if summary_path.exists() else ""
+
+        regression_best = _text_contains_positive(summary_text, "regression")
+        if not regression_best:
+            regression_best = _text_contains_positive(summary_text, "noisyregression")
+        report.criteria.append(CriterionResult(
+            name="identifies_best",
+            passed=regression_best,
+            detail=(
+                "correctly identifies NoisyRegression (prose fallback)"
+                if regression_best
+                else "did not identify NoisyRegression as best (prose fallback)"
+            ),
+        ))
+
+        summary_lower = summary_text.lower()
+        climatology_ref = (
+            "climatology" in summary_lower
+            and ("baseline" in summary_lower or "reference" in summary_lower
+                 or "benchmark" in summary_lower or "relative" in summary_lower
+                 or "compared" in summary_lower or "skill" in summary_lower)
+        )
+        report.criteria.append(CriterionResult(
+            name="identifies_reference",
+            passed=climatology_ref,
+            detail=(
+                "correctly references Climatology baseline (prose fallback)"
+                if climatology_ref
+                else "did not mention Climatology as reference (prose fallback)"
+            ),
+        ))
+
+    return report
+
+
+# ── Grader dispatch ──────────────────────────────────────────────────────
+
+GRADERS = {
+    "Drug Efficacy Validation": grade_drug_efficacy,
+    "Weather Prediction Validation": grade_weather,
+}
+
+
+def grade_output(brief_name: str, output_dir: str | Path) -> GradeReport:
+    """Grade agent output using the appropriate domain grader."""
+    grader = GRADERS.get(brief_name)
+    if grader is None:
+        raise ValueError(
+            f"No grader for brief '{brief_name}'. "
+            f"Available: {list(GRADERS.keys())}"
+        )
+    return grader(output_dir)
+#+end_src
+
+
+* Updated Earlier Tests
+
+The grader now produces 5 criteria instead of 4 (added =verdict_valid=).
+Tests from earlier lessons that assert =total_count == 4= need updating.
+
+#+begin_src python :tangle ../test/test_live_agent.py
+"""End-to-end test: run the simulated agent, grade its output.
+
+This is DMT testing itself: the framework is the model, the agent's
+success/failure is the data, and the grading criteria are the test.
+
+Lesson 06: updated to expect agent_verdict.json instead of agent_summary.txt.
+Lesson 07: total_count is now 5 (added verdict_valid criterion).
+"""
+
+from pathlib import Path
+
+from dmt.agent.runner import run_agent
+from dmt.agent.grader import grade_drug_efficacy
+
+
+# Path to the simulated agent script (relative to repo root)
+AGENT_SCRIPT = Path(__file__).parent.parent / "scripts" / "simulated_agent.py"
+
+
+def test_simulated_agent_produces_report(tmp_path):
+    """The simulated agent should produce a valid report and verdict."""
+    result = run_agent(AGENT_SCRIPT, output_dir=tmp_path / "agent_output")
+
+    assert result.success, (
+        f"Agent script failed with return code {result.return_code}.\n"
+        f"stderr: {result.stderr}"
+    )
+    assert result.report_exists, "Agent did not produce report.md"
+    assert result.verdict_exists, "Agent did not produce agent_verdict.json"
+
+
+def test_simulated_agent_passes_all_criteria(tmp_path):
+    """The simulated agent's output should pass all grading criteria."""
+    output_dir = tmp_path / "agent_output"
+
+    # Run the agent
+    result = run_agent(AGENT_SCRIPT, output_dir=output_dir)
+    assert result.success, f"Agent failed: {result.stderr}"
+
+    # Grade the output
+    grade = grade_drug_efficacy(output_dir)
+
+    # Print the grade report for visibility
+    print("\n" + grade.summary())
+
+    # Assert all criteria pass
+    for criterion in grade.criteria:
+        assert criterion.passed, (
+            f"Criterion '{criterion.name}' FAILED: {criterion.detail}"
+        )
+
+    assert grade.all_passed, (
+        f"Agent scored {grade.pass_count}/{grade.total_count}"
+    )
+
+
+def test_grade_report_structure(tmp_path):
+    """The grade report should have the expected structure."""
+    output_dir = tmp_path / "agent_output"
+    result = run_agent(AGENT_SCRIPT, output_dir=output_dir)
+    assert result.success
+
+    grade = grade_drug_efficacy(output_dir)
+
+    assert grade.agent_name == "Drug Efficacy Validation"
+    assert grade.total_count == 5  # report, sections, verdict_valid, best, worst
+    assert grade.score == 1.0
+    assert "PASS" in grade.summary()
+    assert "FAIL" not in grade.summary()
+
+
+def test_agent_brief_is_self_contained():
+    """The brief alone should contain all information needed."""
+    from dmt.agent.brief import DRUG_EFFICACY_BRIEF
+
+    prompt = DRUG_EFFICACY_BRIEF.to_prompt()
+
+    # The brief mentions all necessary imports
+    assert "dmt.evaluate" in prompt
+    assert "dmt.scenario.drug_efficacy" in prompt
+    assert "evaluate" in prompt
+    assert "DRUG_EFFICACY" in prompt
+
+    # The brief has all four steps
+    assert "generate_observations" in prompt
+    assert "LinearModel" in prompt
+    assert "evaluate(models=" in prompt
+    assert "verdict" in prompt.lower()
+
+    # The brief has success criteria
+    assert "report" in prompt.lower()
+    assert "Calibrated" in prompt
+#+end_src
+
+The tournament test also needs updating: =test_weather_grader_missing_report=
+asserts 4 criteria, but now there are 5 (=verdict_valid= added to the skip
+list when report is missing).
+
+#+begin_src python :tangle ../test/test_tournament.py
+"""Tests for weather brief, tournament runner, and expanded grader.
+
+Lesson 07: total_count updated from 4 to 5 (verdict_valid criterion added).
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from dmt.agent.brief import WEATHER_BRIEF, DRUG_EFFICACY_BRIEF
+from dmt.agent.grader import grade_weather, grade_drug_efficacy, grade_output
+
+
+# ── Weather brief tests ──────────────────────────────────────────────────────
+
+def test_weather_brief_is_complete():
+    """Weather brief should contain all necessary information."""
+    prompt = WEATHER_BRIEF.to_prompt()
+
+    assert "dmt.evaluate" in prompt
+    assert "dmt.scenario.weather" in prompt
+    assert "WEATHER" in prompt
+    assert "generate_observations" in prompt
+    assert "PersistenceModel" in prompt
+    assert "ClimatologyModel" in prompt
+    assert "NoisyRegressionModel" in prompt
+    assert "evaluate(models=" in prompt
+
+
+# ── Weather grader tests ─────────────────────────────────────────────────────
+
+def test_weather_grader_all_pass(tmp_path):
+    """Weather grader should pass when output is correct."""
+    # Create a minimal correct report
+    report = tmp_path / "report.md"
+    report.write_text(
+        "# Weather Report\n\n"
+        "## Abstract\n\nWe evaluate...\n\n"
+        "## Introduction\n\n...\n\n"
+        "## Methods\n\n...\n\n"
+        "## Results\n\n...\n\n"
+        "## Discussion\n\n...\n\n"
+        "## Conclusion\n\n...\n"
+    )
+    # Use JSON verdict (primary path since Lesson 06)
+    verdict = {
+        "best_model": "NoisyRegressionModel",
+        "best_reason": "lowest RMSE",
+        "worst_model": "PersistenceModel",
+        "worst_reason": "cannot adapt",
+        "reference_model": "ClimatologyModel",
+        "summary": "Regression is best, Climatology is baseline.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
+
+    grade = grade_weather(tmp_path)
+    assert grade.all_passed, grade.summary()
+    assert grade.score == 1.0
+
+
+def test_weather_grader_missing_report(tmp_path):
+    """Weather grader should handle missing report gracefully."""
+    grade = grade_weather(tmp_path)
+    assert grade.pass_count == 0
+    assert grade.total_count == 5  # report, sections, verdict_valid, best, reference
+
+
+# ── Generic grade_output dispatch ────────────────────────────────────────────
+
+def test_grade_output_dispatches_drug():
+    """grade_output should dispatch to the drug grader."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        grade = grade_output("Drug Efficacy Validation", tmp)
+        assert grade.agent_name == "Drug Efficacy Validation"
+
+
+def test_grade_output_dispatches_weather():
+    """grade_output should dispatch to the weather grader."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        grade = grade_output("Weather Prediction Validation", tmp)
+        assert grade.agent_name == "Weather Prediction Validation"
+
+
+def test_grade_output_unknown_raises():
+    """grade_output should raise for unknown brief names."""
+    with pytest.raises(ValueError, match="No grader"):
+        grade_output("Unknown Brief", "/tmp")
+
+
+# ── Simulated weather agent test ─────────────────────────────────────────────
+
+def test_simulated_weather_agent(tmp_path):
+    """A hand-written weather agent should score 5/5 via JSON verdict."""
+    from dmt.evaluate import evaluate, WEATHER
+    from dmt.scenario.weather import (
+        generate_observations,
+        PersistenceModel,
+        ClimatologyModel,
+        NoisyRegressionModel,
+    )
+
+    output_dir = tmp_path / "weather_output"
+
+    obs = generate_observations(n_days=365, seed=42)
+    persistence = PersistenceModel()
+    climatology = ClimatologyModel()
+    regression = NoisyRegressionModel(alpha=0.7, noise_std=0.5)
+
+    evaluate(
+        models=[persistence, climatology, regression],
+        observations=obs,
+        scenario=WEATHER,
+        reference_model=climatology,
+        output_dir=output_dir,
+        title="Weather Prediction Model Comparison",
+    )
+
+    # Write a correct JSON verdict
+    verdict = {
+        "best_model": "NoisyRegressionModel",
+        "best_reason": "lowest RMSE across all cities",
+        "worst_model": "PersistenceModel",
+        "worst_reason": "cannot adapt to seasonal shifts",
+        "reference_model": "ClimatologyModel",
+        "summary": (
+            "The NoisyRegression model achieves the lowest RMSE. "
+            "Relative to the Climatology baseline, it captures "
+            "day-to-day temperature variability that simpler models miss."
+        ),
+    }
+    verdict_path = output_dir / "agent_verdict.json"
+    verdict_path.write_text(json.dumps(verdict, indent=2))
+
+    grade = grade_weather(output_dir)
+    assert grade.all_passed, grade.summary()
+#+end_src
+
+
+* Tests
+
+We test three layers:
+
+1. *=validate_verdict=*: the pure validator function
+2. *=load_validated=*: file I/O + validation in one step
+3. *Grading integration*: how the grader handles valid, invalid, and absent verdicts
+
+#+begin_src python :tangle ../test/test_schema_validation.py
+"""Tests for Lesson 07: schema validation.
+
+Tests the validator, load_validated, and grader integration with
+malformed verdicts.
+"""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from dmt.agent.verdict import (
+    AgentVerdict,
+    ValidationResult,
+    validate_verdict,
+    REQUIRED_FIELDS,
+    VERDICT_FILENAME,
+)
+from dmt.agent.grader import grade_drug_efficacy, grade_weather
+
+
+# ── Helper ───────────────────────────────────────────────────────────────
+
+def _complete_verdict() -> dict:
+    """A valid verdict dict."""
+    return {
+        "best_model": "CalibratedModel",
+        "best_reason": "lowest RMSE",
+        "worst_model": "LinearModel",
+        "worst_reason": "fails on sigmoidal data",
+        "reference_model": "LinearModel",
+        "summary": "Calibrated wins, Linear loses.",
+    }
+
+
+def _make_report(tmp_path: Path) -> None:
+    """Create a minimal valid report.md."""
+    (tmp_path / "report.md").write_text(
+        "# Report\n\n"
+        "## Abstract\n\ntext\n\n"
+        "## Introduction\n\ntext\n\n"
+        "## Methods\n\ntext\n\n"
+        "## Results\n\ntext\n\n"
+        "## Discussion\n\ntext\n\n"
+        "## Conclusion\n\ntext\n"
+    )
+
+
+# ── validate_verdict tests ───────────────────────────────────────────────
+
+class TestValidateVerdict:
+
+    def test_valid_complete(self):
+        """Complete verdict should validate."""
+        result = validate_verdict(_complete_verdict())
+        assert result.valid
+        assert result.errors == []
+
+    def test_missing_one_field(self):
+        """Missing a single field should produce one error."""
+        data = _complete_verdict()
+        del data["worst_model"]
+        result = validate_verdict(data)
+        assert not result.valid
+        assert len(result.errors) == 1
+        assert "missing: worst_model" in result.errors[0]
+
+    def test_missing_multiple_fields(self):
+        """Missing multiple fields should produce multiple errors."""
+        data = {"best_model": "X"}
+        result = validate_verdict(data)
+        assert not result.valid
+        assert len(result.errors) == 5  # missing 5 of 6 required
+
+    def test_empty_dict(self):
+        """Empty dict should fail with 6 missing-field errors."""
+        result = validate_verdict({})
+        assert not result.valid
+        assert len(result.errors) == 6
+
+    def test_wrong_type_int(self):
+        """Integer where string expected should fail."""
+        data = _complete_verdict()
+        data["best_model"] = 42
+        result = validate_verdict(data)
+        assert not result.valid
+        assert any("expected str, got int" in e for e in result.errors)
+
+    def test_wrong_type_none(self):
+        """None where string expected should fail."""
+        data = _complete_verdict()
+        data["summary"] = None
+        result = validate_verdict(data)
+        assert not result.valid
+        assert any("expected str, got NoneType" in e for e in result.errors)
+
+    def test_wrong_type_list(self):
+        """List where string expected should fail."""
+        data = _complete_verdict()
+        data["best_reason"] = ["a", "b"]
+        result = validate_verdict(data)
+        assert not result.valid
+        assert any("expected str, got list" in e for e in result.errors)
+
+    def test_empty_string(self):
+        """Empty string should fail."""
+        data = _complete_verdict()
+        data["best_model"] = ""
+        result = validate_verdict(data)
+        assert not result.valid
+        assert any("empty string" in e for e in result.errors)
+
+    def test_whitespace_only(self):
+        """Whitespace-only string should fail."""
+        data = _complete_verdict()
+        data["best_model"] = "   "
+        result = validate_verdict(data)
+        assert not result.valid
+        assert any("empty string" in e for e in result.errors)
+
+    def test_extra_fields_ok(self):
+        """Extra fields should not cause validation failure."""
+        data = _complete_verdict()
+        data["extra"] = {"rmse": 0.42}
+        data["unexpected_key"] = "fine"
+        result = validate_verdict(data)
+        assert result.valid
+
+    def test_summary_is_human_readable(self):
+        """summary() should produce a readable string."""
+        data = _complete_verdict()
+        del data["worst_model"]
+        result = validate_verdict(data)
+        s = result.summary()
+        assert "invalid" in s
+        assert "worst_model" in s
+
+    def test_valid_summary(self):
+        """Valid verdict summary should say 'valid'."""
+        result = validate_verdict(_complete_verdict())
+        assert result.summary() == "verdict valid"
+
+
+# ── load_validated tests ─────────────────────────────────────────────────
+
+class TestLoadValidated:
+
+    def test_file_not_found(self, tmp_path):
+        """Should return None + error when file doesn't exist."""
+        verdict, result = AgentVerdict.load_validated(tmp_path)
+        assert verdict is None
+        assert not result.valid
+        assert "file not found" in result.errors[0]
+
+    def test_invalid_json(self, tmp_path):
+        """Should return None + error for malformed JSON."""
+        (tmp_path / VERDICT_FILENAME).write_text("not json {{{")
+        verdict, result = AgentVerdict.load_validated(tmp_path)
+        assert verdict is None
+        assert not result.valid
+        assert any("invalid JSON" in e for e in result.errors)
+
+    def test_json_array_not_object(self, tmp_path):
+        """JSON array instead of object should fail."""
+        (tmp_path / VERDICT_FILENAME).write_text('[1, 2, 3]')
+        verdict, result = AgentVerdict.load_validated(tmp_path)
+        assert verdict is None
+        assert not result.valid
+        assert any("expected JSON object" in e for e in result.errors)
+
+    def test_schema_invalid(self, tmp_path):
+        """Valid JSON but missing fields should fail."""
+        (tmp_path / VERDICT_FILENAME).write_text('{"best_model": "X"}')
+        verdict, result = AgentVerdict.load_validated(tmp_path)
+        assert verdict is None
+        assert not result.valid
+
+    def test_valid_verdict(self, tmp_path):
+        """Valid verdict should return the AgentVerdict object."""
+        data = _complete_verdict()
+        (tmp_path / VERDICT_FILENAME).write_text(json.dumps(data))
+        verdict, result = AgentVerdict.load_validated(tmp_path)
+        assert verdict is not None
+        assert result.valid
+        assert verdict.best_model == "CalibratedModel"
+
+
+# ── Grader integration: verdict_valid criterion ──────────────────────────
+
+class TestGraderValidation:
+
+    def test_valid_verdict_shows_criterion(self, tmp_path):
+        """Valid verdict should produce a passing verdict_valid criterion."""
+        _make_report(tmp_path)
+        (tmp_path / VERDICT_FILENAME).write_text(json.dumps(_complete_verdict()))
+
+        grade = grade_drug_efficacy(tmp_path)
+        vc = next(c for c in grade.criteria if c.name == "verdict_valid")
+        assert vc.passed
+        assert "verdict valid" in vc.detail
+
+    def test_invalid_verdict_fails_criterion(self, tmp_path):
+        """Invalid verdict should fail verdict_valid and domain criteria."""
+        _make_report(tmp_path)
+        (tmp_path / VERDICT_FILENAME).write_text('{"best_model": "X"}')
+
+        grade = grade_drug_efficacy(tmp_path)
+        vc = next(c for c in grade.criteria if c.name == "verdict_valid")
+        assert not vc.passed
+        assert "missing" in vc.detail
+
+        # Domain criteria should also fail with diagnostic
+        best = next(c for c in grade.criteria if c.name == "identifies_best")
+        assert not best.passed
+        assert "verdict invalid" in best.detail
+
+    def test_malformed_json_fails(self, tmp_path):
+        """Non-JSON verdict file should fail verdict_valid."""
+        _make_report(tmp_path)
+        (tmp_path / VERDICT_FILENAME).write_text("This is prose, not JSON!")
+
+        grade = grade_drug_efficacy(tmp_path)
+        vc = next(c for c in grade.criteria if c.name == "verdict_valid")
+        assert not vc.passed
+        assert "invalid JSON" in vc.detail
+
+    def test_prose_fallback_no_verdict_criterion(self, tmp_path):
+        """Prose fallback should NOT produce a verdict_valid criterion."""
+        _make_report(tmp_path)
+        (tmp_path / "agent_summary.txt").write_text(
+            "The CalibratedModel achieves the best performance with lowest RMSE. "
+            "The LinearModel fails to capture the sigmoidal dose-response."
+        )
+
+        grade = grade_drug_efficacy(tmp_path)
+        names = [c.name for c in grade.criteria]
+        assert "verdict_valid" not in names
+        assert grade.all_passed
+
+    def test_weather_valid_verdict(self, tmp_path):
+        """Weather grader should also validate verdict schema."""
+        _make_report(tmp_path)
+        verdict = {
+            "best_model": "NoisyRegressionModel",
+            "best_reason": "lowest RMSE",
+            "worst_model": "PersistenceModel",
+            "worst_reason": "bad",
+            "reference_model": "ClimatologyModel",
+            "summary": "Regression wins.",
+        }
+        (tmp_path / VERDICT_FILENAME).write_text(json.dumps(verdict))
+
+        grade = grade_weather(tmp_path)
+        vc = next(c for c in grade.criteria if c.name == "verdict_valid")
+        assert vc.passed
+        assert grade.all_passed
+
+    def test_weather_invalid_verdict(self, tmp_path):
+        """Weather grader should catch invalid verdict schema."""
+        _make_report(tmp_path)
+        (tmp_path / VERDICT_FILENAME).write_text('{"best_model": 42}')
+
+        grade = grade_weather(tmp_path)
+        vc = next(c for c in grade.criteria if c.name == "verdict_valid")
+        assert not vc.passed
+
+    def test_no_report_skips_all(self, tmp_path):
+        """Missing report should skip all criteria including verdict_valid."""
+        grade = grade_drug_efficacy(tmp_path)
+        assert grade.pass_count == 0
+        names = [c.name for c in grade.criteria]
+        assert "verdict_valid" in names
+        assert all(not c.passed for c in grade.criteria)
+
+    def test_correct_criterion_count_json(self, tmp_path):
+        """With JSON verdict: 5 criteria (report, sections, verdict_valid, best, worst)."""
+        _make_report(tmp_path)
+        (tmp_path / VERDICT_FILENAME).write_text(json.dumps(_complete_verdict()))
+        grade = grade_drug_efficacy(tmp_path)
+        assert grade.total_count == 5
+
+    def test_correct_criterion_count_prose(self, tmp_path):
+        """With prose fallback: 4 criteria (report, sections, best, worst)."""
+        _make_report(tmp_path)
+        (tmp_path / "agent_summary.txt").write_text(
+            "The CalibratedModel is the best with lowest RMSE. "
+            "LinearModel fails on the sigmoid."
+        )
+        grade = grade_drug_efficacy(tmp_path)
+        assert grade.total_count == 4
+#+end_src
+
+
+* What We've Built
+
+After this lesson, the grading pipeline catches malformed verdicts /before/
+attempting domain-specific grading:
+
+#+begin_example
+  Lesson 06 flow:             Lesson 07 flow:
+
+  verdict.json exists?        verdict.json exists?
+  ├── yes → check fields      ├── yes → validate schema
+  │                           │   ├── valid → check fields (criterion: verdict_valid PASS)
+  │                           │   └── invalid → fail all + diagnostic
+  └── no → prose fallback     └── no → prose fallback (no verdict_valid criterion)
+#+end_example
+
+The key improvement: when a weaker LLM writes ={"best_model": 42}= or forgets
+=worst_model=, the grade report says exactly what went wrong:
+
+#+begin_example
+  [FAIL] verdict_valid: verdict invalid: best_model: expected str, got int
+  [FAIL] identifies_best: skipped (verdict invalid: ...)
+  [FAIL] identifies_worst: skipped (verdict invalid: ...)
+#+end_example
+
+| Component          | Lesson 06             | Lesson 07                     |
+|--------------------+-----------------------+-------------------------------|
+| Verdict loading    | silent fallback       | explicit ValidationResult     |
+| Schema checking    | none                  | validate_verdict()            |
+| Grading criteria   | 4 per domain          | 5 per domain (+ verdict_valid) |
+| Error diagnostics  | "expected Calibrated" | "missing: worst_model"        |
+| Prose fallback     | always available      | still available, no change    |
+
+
+* Requirements                                                     :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 07-schema-validation
+tag: lesson/07-schema-validation
+depends_on: 06-structured-output
+files_modified:
+  - src/dmt/agent/verdict.py   # + validate_verdict, ValidationResult, load_validated
+  - src/dmt/agent/grader.py    # verdict_valid criterion, validation integration
+files_tested:
+  - test/test_schema_validation.py
+verification:
+  - "uv run --extra dev pytest test/ -v — all tests pass"
+  - "validate_verdict catches missing fields, wrong types, empty strings"
+  - "grader produces verdict_valid criterion with diagnostics"
+  - "prose fallback still works unchanged"
+next_lesson: 08-eval-harness
+#+end_src
+
+* Local Variables                                                  :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

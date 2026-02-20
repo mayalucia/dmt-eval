@@ -1,5 +1,9 @@
-"""Tests for weather brief, tournament runner, and expanded grader."""
+"""Tests for weather brief, tournament runner, and expanded grader.
 
+Lesson 07: total_count updated from 4 to 5 (verdict_valid criterion added).
+"""
+
+import json
 from pathlib import Path
 
 import pytest
@@ -39,15 +43,16 @@ def test_weather_grader_all_pass(tmp_path):
         "## Discussion\n\n...\n\n"
         "## Conclusion\n\n...\n"
     )
-    summary = tmp_path / "agent_summary.txt"
-    summary.write_text(
-        "The NoisyRegression model achieves the best performance "
-        "with the lowest RMSE across all cities. "
-        "Compared to the Climatology baseline, it shows significant "
-        "improvement in capturing day-to-day weather variability. "
-        "Persistence performs reasonably but cannot match the "
-        "regression model's skill."
-    )
+    # Use JSON verdict (primary path since Lesson 06)
+    verdict = {
+        "best_model": "NoisyRegressionModel",
+        "best_reason": "lowest RMSE",
+        "worst_model": "PersistenceModel",
+        "worst_reason": "cannot adapt",
+        "reference_model": "ClimatologyModel",
+        "summary": "Regression is best, Climatology is baseline.",
+    }
+    (tmp_path / "agent_verdict.json").write_text(json.dumps(verdict))
 
     grade = grade_weather(tmp_path)
     assert grade.all_passed, grade.summary()
@@ -58,7 +63,7 @@ def test_weather_grader_missing_report(tmp_path):
     """Weather grader should handle missing report gracefully."""
     grade = grade_weather(tmp_path)
     assert grade.pass_count == 0
-    assert grade.total_count == 4
+    assert grade.total_count == 5  # report, sections, verdict_valid, best, reference
 
 
 # ── Generic grade_output dispatch ────────────────────────────────────────────
@@ -88,7 +93,7 @@ def test_grade_output_unknown_raises():
 # ── Simulated weather agent test ─────────────────────────────────────────────
 
 def test_simulated_weather_agent(tmp_path):
-    """A hand-written weather agent should score 4/4."""
+    """A hand-written weather agent should score 5/5 via JSON verdict."""
     from dmt.evaluate import evaluate, WEATHER
     from dmt.scenario.weather import (
         generate_observations,
@@ -113,15 +118,21 @@ def test_simulated_weather_agent(tmp_path):
         title="Weather Prediction Model Comparison",
     )
 
-    # Write a correct summary
-    summary_path = output_dir / "agent_summary.txt"
-    summary_path.write_text(
-        "The NoisyRegression model achieves the lowest RMSE, "
-        "demonstrating the best predictive skill across all cities. "
-        "Relative to the Climatology baseline, it captures "
-        "day-to-day temperature variability that simpler models miss. "
-        "Persistence performs worst as it cannot adapt to seasonal shifts."
-    )
+    # Write a correct JSON verdict
+    verdict = {
+        "best_model": "NoisyRegressionModel",
+        "best_reason": "lowest RMSE across all cities",
+        "worst_model": "PersistenceModel",
+        "worst_reason": "cannot adapt to seasonal shifts",
+        "reference_model": "ClimatologyModel",
+        "summary": (
+            "The NoisyRegression model achieves the lowest RMSE. "
+            "Relative to the Climatology baseline, it captures "
+            "day-to-day temperature variability that simpler models miss."
+        ),
+    }
+    verdict_path = output_dir / "agent_verdict.json"
+    verdict_path.write_text(json.dumps(verdict, indent=2))
 
     grade = grade_weather(output_dir)
     assert grade.all_passed, grade.summary()

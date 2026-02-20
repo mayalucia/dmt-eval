@@ -1,12 +1,15 @@
 """Grade an agent's output against success criteria.
 
 Lesson 06: structured JSON verdict is the primary grading path.
+Lesson 07: schema validation before grading.
 Falls back to prose keyword matching if agent_verdict.json is absent.
 """
 
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dmt.agent.verdict import validate_verdict, ValidationResult, VERDICT_FILENAME
 
 
 @dataclass
@@ -54,17 +57,34 @@ class GradeReport:
         return "\n".join(lines)
 
 
-# ── Verdict loading ──────────────────────────────────────────────────────
+# ── Verdict loading + validation ─────────────────────────────────────────
 
-def _load_verdict(output_dir: Path) -> dict | None:
-    """Try to load agent_verdict.json, return None if absent or invalid."""
-    verdict_path = output_dir / "agent_verdict.json"
+def _load_and_validate_verdict(output_dir: Path) -> tuple[dict | None, ValidationResult | None]:
+    """Load and validate agent_verdict.json.
+
+    Returns (parsed_dict, validation_result).
+    - If file doesn't exist: (None, None) — triggers prose fallback.
+    - If file exists but invalid JSON: (None, ValidationResult with errors).
+    - If file exists, valid JSON, but bad schema: (dict, ValidationResult with errors).
+    - If file exists and schema-valid: (dict, ValidationResult ok).
+    """
+    verdict_path = output_dir / VERDICT_FILENAME
     if not verdict_path.exists():
-        return None
+        return None, None
+
     try:
-        return json.loads(verdict_path.read_text())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        data = json.loads(verdict_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        return None, ValidationResult(valid=False, errors=[f"invalid JSON: {e}"])
+
+    if not isinstance(data, dict):
+        return None, ValidationResult(
+            valid=False,
+            errors=[f"expected JSON object, got {type(data).__name__}"]
+        )
+
+    result = validate_verdict(data)
+    return data, result
 
 
 # ── Prose fallback (kept for backward compatibility) ─────────────────────
@@ -128,7 +148,7 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     ))
 
     if not exists:
-        for name in ["has_sections", "identifies_best", "identifies_worst"]:
+        for name in ["has_sections", "verdict_valid", "identifies_best", "identifies_worst"]:
             report.criteria.append(CriterionResult(
                 name=name, passed=False, detail="skipped (no report)",
             ))
@@ -139,35 +159,55 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     # ── Criterion 2: Has required sections ────────────────────────────
     report.criteria.append(_check_report_sections(report_text))
 
-    # ── Try structured verdict first ──────────────────────────────────
-    verdict = _load_verdict(output_dir)
+    # ── Load and validate verdict ─────────────────────────────────────
+    verdict, validation = _load_and_validate_verdict(output_dir)
 
-    if verdict is not None:
-        # ── Criterion 3: best_model == "CalibratedModel" (or close) ──
-        best = verdict.get("best_model", "")
-        calibrated_best = "calibrat" in best.lower()
+    if validation is not None:
+        # File existed — report validation result
         report.criteria.append(CriterionResult(
-            name="identifies_best",
-            passed=calibrated_best,
-            detail=(
-                f"verdict.best_model={best!r}" if calibrated_best
-                else f"verdict.best_model={best!r} (expected Calibrated)"
-            ),
+            name="verdict_valid",
+            passed=validation.valid,
+            detail=validation.summary(),
         ))
 
-        # ── Criterion 4: worst_model == "LinearModel" (or close) ─────
-        worst = verdict.get("worst_model", "")
-        linear_worst = "linear" in worst.lower()
-        report.criteria.append(CriterionResult(
-            name="identifies_worst",
-            passed=linear_worst,
-            detail=(
-                f"verdict.worst_model={worst!r}" if linear_worst
-                else f"verdict.worst_model={worst!r} (expected Linear)"
-            ),
-        ))
+        if validation.valid:
+            # ── Criterion 4: best_model == "CalibratedModel" ─────────
+            best = verdict.get("best_model", "")
+            calibrated_best = "calibrat" in best.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=calibrated_best,
+                detail=(
+                    f"verdict.best_model={best!r}" if calibrated_best
+                    else f"verdict.best_model={best!r} (expected Calibrated)"
+                ),
+            ))
+
+            # ── Criterion 5: worst_model == "LinearModel" ────────────
+            worst = verdict.get("worst_model", "")
+            linear_worst = "linear" in worst.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_worst",
+                passed=linear_worst,
+                detail=(
+                    f"verdict.worst_model={worst!r}" if linear_worst
+                    else f"verdict.worst_model={worst!r} (expected Linear)"
+                ),
+            ))
+        else:
+            # Schema invalid — domain criteria auto-fail with diagnostic
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
+            report.criteria.append(CriterionResult(
+                name="identifies_worst",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
     else:
-        # ── Prose fallback ────────────────────────────────────────────
+        # ── Prose fallback (no verdict file) ──────────────────────────
         summary_path = output_dir / "agent_summary.txt"
         summary_text = summary_path.read_text() if summary_path.exists() else ""
 
@@ -217,7 +257,7 @@ def grade_weather(output_dir: str | Path) -> GradeReport:
     ))
 
     if not exists:
-        for name in ["has_sections", "identifies_best", "identifies_reference"]:
+        for name in ["has_sections", "verdict_valid", "identifies_best", "identifies_reference"]:
             report.criteria.append(CriterionResult(
                 name=name, passed=False, detail="skipped (no report)",
             ))
@@ -228,35 +268,55 @@ def grade_weather(output_dir: str | Path) -> GradeReport:
     # ── Criterion 2: Has required sections ────────────────────────────
     report.criteria.append(_check_report_sections(report_text))
 
-    # ── Try structured verdict first ──────────────────────────────────
-    verdict = _load_verdict(output_dir)
+    # ── Load and validate verdict ─────────────────────────────────────
+    verdict, validation = _load_and_validate_verdict(output_dir)
 
-    if verdict is not None:
-        # ── Criterion 3: best_model contains "Regression" ─────────────
-        best = verdict.get("best_model", "")
-        regression_best = "regression" in best.lower()
+    if validation is not None:
+        # File existed — report validation result
         report.criteria.append(CriterionResult(
-            name="identifies_best",
-            passed=regression_best,
-            detail=(
-                f"verdict.best_model={best!r}" if regression_best
-                else f"verdict.best_model={best!r} (expected NoisyRegression)"
-            ),
+            name="verdict_valid",
+            passed=validation.valid,
+            detail=validation.summary(),
         ))
 
-        # ── Criterion 4: reference_model contains "Climatology" ───────
-        ref = verdict.get("reference_model", "")
-        climatology_ref = "climatology" in ref.lower()
-        report.criteria.append(CriterionResult(
-            name="identifies_reference",
-            passed=climatology_ref,
-            detail=(
-                f"verdict.reference_model={ref!r}" if climatology_ref
-                else f"verdict.reference_model={ref!r} (expected Climatology)"
-            ),
-        ))
+        if validation.valid:
+            # ── Criterion 4: best_model contains "Regression" ─────────
+            best = verdict.get("best_model", "")
+            regression_best = "regression" in best.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=regression_best,
+                detail=(
+                    f"verdict.best_model={best!r}" if regression_best
+                    else f"verdict.best_model={best!r} (expected NoisyRegression)"
+                ),
+            ))
+
+            # ── Criterion 5: reference_model contains "Climatology" ───
+            ref = verdict.get("reference_model", "")
+            climatology_ref = "climatology" in ref.lower()
+            report.criteria.append(CriterionResult(
+                name="identifies_reference",
+                passed=climatology_ref,
+                detail=(
+                    f"verdict.reference_model={ref!r}" if climatology_ref
+                    else f"verdict.reference_model={ref!r} (expected Climatology)"
+                ),
+            ))
+        else:
+            # Schema invalid — domain criteria auto-fail with diagnostic
+            report.criteria.append(CriterionResult(
+                name="identifies_best",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
+            report.criteria.append(CriterionResult(
+                name="identifies_reference",
+                passed=False,
+                detail=f"skipped (verdict invalid: {validation.summary()})",
+            ))
     else:
-        # ── Prose fallback ────────────────────────────────────────────
+        # ── Prose fallback (no verdict file) ──────────────────────────
         summary_path = output_dir / "agent_summary.txt"
         summary_text = summary_path.read_text() if summary_path.exists() else ""
 
