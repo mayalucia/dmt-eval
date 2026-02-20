@@ -1,0 +1,667 @@
+#+title: Lesson 00 — The Document Builder
+#+subtitle: From verbose class hierarchies to decorator-driven document assembly
+#+author: DMT Modernization (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+DMT's original document system required authors to instantiate deeply nested class
+hierarchies: =Document=, =LabReport=, =Section=, =Abstract=, =Methods=, =Results= —
+each a =WithFields= subclass inheriting from multiple mixins (=Narrative=, =Data=,
+=Illustration=). The result was powerful but intimidating. A simple analysis required
+understanding metaclasses, field descriptors, and MRO-dependent =__call__= chains
+before writing a single line of domain logic.
+
+The *DocumentBuilder* inverts the flow. Instead of constructing objects bottom-up and
+wiring them together, the scientist /declares/ sections using Python decorators:
+
+#+begin_example
+  document = DocumentBuilder("Cell Composition Analysis")
+
+  @document.abstract
+  def _():
+      """We analyze cell densities across cortical layers."""
+      pass
+
+  @document.section("Introduction").illustration
+  def scaffold():
+      """A digitally reconstructed neocortical column."""
+      return Path("resources/neocortical_scaffold.png")
+#+end_example
+
+The builder accumulates these declarations and can later produce a full =Document= or
+=LabReport= instance. This is DMT's *Level 5 interface* — the decorator API that
+makes the framework feel like writing a paper, not configuring a pipeline.
+
+** Learning Objectives
+
+- [ ] Understand the gap between DMT's existing document system and modern Python idioms
+- [ ] Implement =SectionProxy= — the accumulator for a single document section
+- [ ] Implement =DocumentBuilder= — the orchestrator that routes decorators to proxies
+- [ ] Verify against two test prototypes that define the expected API contract
+
+** File Map
+
+| File                           | Role                                          |
+|--------------------------------+-----------------------------------------------|
+| =src/dmt/document/builder.py= | DocumentBuilder + SectionProxy implementation |
+| =test/test_builder.py=        | Unit tests (tangled from this file)           |
+
+* Architecture
+
+The builder sits /above/ the existing document system. It does not replace =Document=,
+=Section=, or =LabReport= — it provides a friendlier construction path into them.
+
+#+begin_example
+  ┌─────────────────────────────────────────────────┐
+  │  Scientist's Code                                │
+  │  @document.section("Introduction")               │
+  │  def _(): """narrative text"""                    │
+  └───────────────────┬─────────────────────────────┘
+                      │ decorates
+  ┌───────────────────┴─────────────────────────────┐
+  │  DocumentBuilder                                  │
+  │  ._sections: OrderedDict[label → SectionProxy]    │
+  │  ._interface_methods: [fn, ...]                   │
+  └───────────────────┬─────────────────────────────┘
+                      │ accumulates into
+  ┌───────────────────┴─────────────────────────────┐
+  │  SectionProxy("Introduction")                     │
+  │  ._functions: OrderedDict[name → fn]              │
+  │  .illustration → _SubElementDecorator             │
+  │  .tables → _SubElementDecorator                   │
+  │  .parameters → _SubElementDecorator               │
+  │  .measurement → _SubElementDecorator              │
+  └───────────────────┬─────────────────────────────┘
+                      │ later builds
+  ┌───────────────────┴─────────────────────────────┐
+  │  Document / LabReport                             │
+  │  (existing WithFields-based class hierarchy)      │
+  └─────────────────────────────────────────────────┘
+#+end_example
+
+The key design decision: =DocumentBuilder= is a *plain Python class*, not a
+=WithFields= subclass. It carries no metaclass overhead, no field descriptors — just
+an =OrderedDict= of =SectionProxy= objects and a list of interface methods. This is
+deliberate. The builder is a /construction tool/, not a /domain object/. It should be
+as lightweight and transparent as possible.
+
+** The =SectionProxy= abstraction
+
+When you write =@document.section("Introduction")=, the builder returns a
+=SectionProxy=. This proxy is callable — using it as a decorator stores the function.
+It also exposes sub-element decorators via properties:
+
+#+begin_example
+  proxy = SectionProxy("Introduction")
+
+  @proxy                    # stores fn under fn.__name__
+  def _(): """narrative"""
+
+  @proxy.illustration       # stores fn under "illustration" key
+  def scaffold(): ...
+
+  @proxy.tables             # stores fn under "tables" key
+  def data(): ...
+#+end_example
+
+The function's *docstring* becomes the section's narrative text. The function's
+*return value* (when eventually called) provides data or illustration content. The
+function's *name* disambiguates when the same section receives multiple decorators.
+
+* Implementation
+
+** The =SectionProxy= class
+
+#+begin_src python :tangle ../src/dmt/document/builder.py
+# SPDX-License-Identifier: MIT
+# dmt-eval — https://github.com/mayalucia/dmt-eval
+#
+# Original architecture: Blue Brain Project / EPFL (2017-2024)
+# Modernised for dmt-eval by Vishal Sood + AI collaborators, 2026.
+
+"""
+Build a document using decorators.
+
+A ``DocumentBuilder`` accumulates section definitions via decorator syntax,
+providing a concise alternative to instantiating ``Document`` / ``LabReport``
+objects with deeply nested keyword arguments.
+
+Example
+-------
+::
+
+    document = DocumentBuilder("Article")
+
+    @document.abstract
+    def _():
+        \"\"\"We analyze the densities of cortical layers.\"\"\"
+        pass
+
+    @document.section("Introduction")
+    def _():
+        \"\"\"The cortex is organized into layers...\"\"\"
+        pass
+
+    @document.section("Introduction").illustration
+    def scaffold():
+        \"\"\"A digitally reconstructed neocortical column.\"\"\"
+        return Path("resources/neocortical_scaffold.png")
+"""
+
+import re
+from collections import OrderedDict
+
+
+_PUNCT = re.compile(r"[,:&#/\\$?^;.]")
+
+
+def make_label(string, separator="_"):
+    """Turn a human string into a snake_case label."""
+    if not isinstance(string, str):
+        string = str(string)
+    words = _PUNCT.sub("", string.strip()).lower().split()
+    return separator.join(w for w in words if w)
+
+
+__all__ = ["DocumentBuilder", "SectionProxy", "make_label"]
+
+
+# ── Section names that LabReport knows about ──────────────────────────────────
+
+_KNOWN_SECTIONS = frozenset({
+    "abstract", "introduction", "methods",
+    "results", "discussion", "conclusion",
+})
+#+end_src
+
+The =SectionProxy= stores decorated functions in an =OrderedDict= keyed by function
+name. Sub-element decorators (=.illustration=, =.tables=, etc.) store under a fixed
+role key instead. This means you can register both a narrative function (stored under
+=_= or its real name) and an illustration function (stored under ="illustration"=) on
+the same proxy without collision.
+
+#+begin_src python :tangle ../src/dmt/document/builder.py
+# ── SectionProxy ──────────────────────────────────────────────────────────────
+
+class SectionProxy:
+    """Accumulator for a single document section.
+
+    Returned by ``DocumentBuilder.section(name)`` and by attribute access
+    on known section names (``document.introduction``).  Callable as a
+    decorator to register the section's primary function (whose docstring
+    becomes the narrative text).  Sub-elements are registered via chained
+    attribute decorators::
+
+        @document.section("Introduction").illustration
+        def scaffold():
+            ...
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.label = make_label(name)
+        self._functions = OrderedDict()
+
+    # ── primary decorator ─────────────────────────────────────────────────
+
+    def __call__(self, fn):
+        """Register *fn* under its own name.
+
+        If the section already has a function with the same name, it is
+        replaced.  This allows calling ``@document.section("X")`` twice
+        with differently-named functions to register e.g. both a
+        measurement and an illustration.
+        """
+        key = fn.__name__
+        # Use the role-specific key when it matches a known sub-element,
+        # otherwise store under the function's own name.
+        self._functions[key] = fn
+        return fn
+
+    # ── sub-element decorators ────────────────────────────────────────────
+
+    @property
+    def illustration(self):
+        """Decorator that registers an illustration function."""
+        return _SubElementDecorator(self, "illustration")
+
+    @property
+    def tables(self):
+        """Decorator that registers a tables / data function."""
+        return _SubElementDecorator(self, "tables")
+
+    @property
+    def parameters(self):
+        """Decorator that registers a parameters function."""
+        return _SubElementDecorator(self, "parameters")
+
+    @property
+    def measurement(self):
+        """Decorator that registers a measurement function."""
+        return _SubElementDecorator(self, "measurement")
+
+    # ── introspection ─────────────────────────────────────────────────────
+
+    def get_narrative(self):
+        """Return the narrative text collected from function docstrings.
+
+        The first registered function whose name is ``_`` (anonymous) or
+        that doesn't match a known sub-element key provides the narrative
+        via its docstring.
+        """
+        sub_keys = {"illustration", "tables", "parameters", "measurement"}
+        for key, fn in self._functions.items():
+            if key not in sub_keys:
+                doc = getattr(fn, "__doc__", None)
+                if doc:
+                    return doc.strip()
+        return None
+
+    def get_function(self, role):
+        """Return the function registered under *role*, or ``None``."""
+        return self._functions.get(role)
+
+    def __repr__(self):
+        roles = list(self._functions.keys())
+        return f"SectionProxy({self.name!r}, functions={roles})"
+#+end_src
+
+** The =_SubElementDecorator= helper
+
+A tiny callable that, when used as =@proxy.illustration=, stores the decorated
+function under a fixed role key in the parent =SectionProxy=. It returns the
+original function unchanged — decoration is transparent.
+
+#+begin_src python :tangle ../src/dmt/document/builder.py
+class _SubElementDecorator:
+    """A callable that, when used as a decorator, stores *fn* in the
+    parent ``SectionProxy`` under the given *role* key."""
+
+    def __init__(self, section_proxy, role):
+        self._section = section_proxy
+        self._role = role
+
+    def __call__(self, fn):
+        self._section._functions[self._role] = fn
+        return fn
+
+    def __repr__(self):
+        return (f"_SubElementDecorator("
+                f"{self._section.name!r}, {self._role!r})")
+#+end_src
+
+** The =DocumentBuilder= class
+
+The builder is the entry point. It accepts either a string title (for a generic
+document) or a =Document= subclass like =LabReport= (for a structured report).
+
+Known section names (=abstract=, =introduction=, =methods=, etc.) are accessed via
+=__getattr__=, which creates or returns the corresponding =SectionProxy=. This means
+=document.introduction= and =document.section("Introduction")= resolve to the same
+proxy.
+
+#+begin_src python :tangle ../src/dmt/document/builder.py
+# ── DocumentBuilder ───────────────────────────────────────────────────────────
+
+class DocumentBuilder:
+    """Accumulate section definitions via decorators, then optionally
+    build a ``Document`` or ``LabReport`` instance.
+
+    Parameters
+    ----------
+    document_class_or_title : str or type
+        Either a plain string title (produces a generic document) or a
+        ``Document`` subclass such as ``LabReport``.
+    **kwargs
+        Forwarded to the document class constructor when ``build()`` is
+        called.  When *document_class_or_title* is a string, ``title``
+        is set automatically.
+    """
+
+    def __init__(self, document_class_or_title, **kwargs):
+        if isinstance(document_class_or_title, str):
+            self._document_class = None
+            self._title = document_class_or_title
+        else:
+            self._document_class = document_class_or_title
+            self._title = kwargs.pop("title", None)
+        self._kwargs = kwargs
+        self._sections = OrderedDict()
+        self._interface_methods = []
+
+    # ── named section access ──────────────────────────────────────────────
+
+    def section(self, name):
+        """Return (or create) the ``SectionProxy`` for *name*.
+
+        Calling ``document.section("X")`` twice returns the *same* proxy,
+        so decorators accumulate on a single section.
+        """
+        label = make_label(name)
+        if label not in self._sections:
+            self._sections[label] = SectionProxy(name)
+        return self._sections[label]
+
+    # ── known-section shortcuts via __getattr__ ───────────────────────────
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name in _KNOWN_SECTIONS:
+            return self.section(name.replace("_", " ").title()
+                                if "_" in name else name.capitalize()
+                                if name == name.lower() else name)
+        raise AttributeError(
+            f"{type(self).__name__!r} has no attribute {name!r}")
+
+    # ── interfacemethod decorator ─────────────────────────────────────────
+
+    @property
+    def interfacemethod(self):
+        """Decorator that registers a function as an interface method."""
+        return _InterfaceMethodDecorator(self)
+
+    # ── introspection ─────────────────────────────────────────────────────
+
+    @property
+    def title(self):
+        return self._title
+
+    @property
+    def sections(self):
+        """Return an ``OrderedDict`` of label -> ``SectionProxy``."""
+        return OrderedDict(self._sections)
+
+    @property
+    def interface_methods(self):
+        return list(self._interface_methods)
+
+    def __repr__(self):
+        cls = (self._document_class.__name__
+               if self._document_class else "Document")
+        sections = list(self._sections.keys())
+        return f"DocumentBuilder({cls}, title={self._title!r}, sections={sections})"
+
+
+class _InterfaceMethodDecorator:
+    """Callable that stores the decorated function in the builder's
+    interface method list."""
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def __call__(self, fn):
+        self._builder._interface_methods.append(fn)
+        return fn
+#+end_src
+
+* Tests
+
+The test below exercises the core API contract: creating a =DocumentBuilder=,
+decorating sections, registering sub-elements, and verifying the accumulated state.
+
+This test is a simplified version of the pre-existing =test_section_builder.py=
+prototype, focused on the builder mechanics rather than full document evaluation.
+
+#+begin_src python :tangle ../test/test_builder.py
+"""Tests for the DocumentBuilder and SectionProxy."""
+
+from collections import OrderedDict
+from dmt.document.builder import DocumentBuilder, SectionProxy
+
+
+class TestSectionProxy:
+    """SectionProxy accumulates decorated functions."""
+
+    def test_callable_as_decorator(self):
+        proxy = SectionProxy("Introduction")
+
+        @proxy
+        def narrative():
+            """The cortex is organized into layers."""
+            pass
+
+        assert "narrative" in proxy._functions
+        assert proxy._functions["narrative"] is narrative
+
+    def test_illustration_sub_decorator(self):
+        proxy = SectionProxy("Introduction")
+
+        @proxy.illustration
+        def scaffold():
+            """A cortical column."""
+            return "scaffold.png"
+
+        assert "illustration" in proxy._functions
+        assert proxy._functions["illustration"] is scaffold
+
+    def test_tables_sub_decorator(self):
+        proxy = SectionProxy("Methods")
+
+        @proxy.tables
+        def reference_data():
+            """Experimental reference."""
+            return {"cell_density": "data.csv"}
+
+        assert "tables" in proxy._functions
+
+    def test_parameters_sub_decorator(self):
+        proxy = SectionProxy("Methods")
+
+        @proxy.parameters
+        def layer_params(adapter, model):
+            return adapter.get_layers(model)
+
+        assert "parameters" in proxy._functions
+
+    def test_get_narrative_from_docstring(self):
+        proxy = SectionProxy("Abstract")
+
+        @proxy
+        def _():
+            """We analyze cell densities across cortical layers."""
+            pass
+
+        assert proxy.get_narrative() == "We analyze cell densities across cortical layers."
+
+    def test_get_narrative_skips_sub_elements(self):
+        proxy = SectionProxy("Introduction")
+
+        @proxy
+        def _():
+            """The cortex has layers."""
+            pass
+
+        @proxy.illustration
+        def img():
+            """Caption for the image."""
+            return "img.png"
+
+        assert proxy.get_narrative() == "The cortex has layers."
+
+    def test_same_section_accumulates(self):
+        proxy = SectionProxy("cell_density")
+
+        @proxy
+        def measurement():
+            """Measure cell density."""
+            pass
+
+        @proxy
+        def illustration():
+            """Plot cell density."""
+            pass
+
+        assert "measurement" in proxy._functions
+        assert "illustration" in proxy._functions
+
+
+class TestDocumentBuilder:
+    """DocumentBuilder routes decorators to SectionProxy instances."""
+
+    def test_string_title(self):
+        doc = DocumentBuilder("Article")
+        assert doc.title == "Article"
+
+    def test_class_with_title(self):
+        class FakeReport:
+            pass
+        doc = DocumentBuilder(FakeReport, title="Analysis")
+        assert doc.title == "Analysis"
+        assert doc._document_class is FakeReport
+
+    def test_section_creates_proxy(self):
+        doc = DocumentBuilder("Article")
+        proxy = doc.section("Introduction")
+        assert isinstance(proxy, SectionProxy)
+        assert proxy.name == "Introduction"
+
+    def test_section_returns_same_proxy(self):
+        doc = DocumentBuilder("Article")
+        p1 = doc.section("Introduction")
+        p2 = doc.section("Introduction")
+        assert p1 is p2
+
+    def test_known_section_via_getattr(self):
+        doc = DocumentBuilder("Article")
+        proxy = doc.abstract
+        assert isinstance(proxy, SectionProxy)
+        assert proxy.label == "abstract"
+
+    def test_abstract_decorator(self):
+        doc = DocumentBuilder("Article")
+
+        @doc.abstract
+        def _():
+            """We analyze cortical layers."""
+            pass
+
+        assert "abstract" in doc.sections
+        assert doc.sections["abstract"].get_narrative() == "We analyze cortical layers."
+
+    def test_chained_sub_element(self):
+        doc = DocumentBuilder("Article")
+
+        @doc.section("Introduction").illustration
+        def scaffold():
+            """A cortical column."""
+            return "scaffold.png"
+
+        proxy = doc.sections["introduction"]
+        assert proxy.get_function("illustration") is scaffold
+
+    def test_interfacemethod(self):
+        doc = DocumentBuilder("Article")
+
+        @doc.interfacemethod
+        def get_layers(adapter, model):
+            pass
+
+        assert len(doc.interface_methods) == 1
+        assert doc.interface_methods[0] is get_layers
+
+    def test_full_workflow(self):
+        """Exercise the complete decorator workflow from test_section_builder."""
+        doc = DocumentBuilder("Article")
+
+        @doc.abstract
+        def _():
+            """We analyze the densities of cortical layers."""
+            pass
+
+        @doc.section("Introduction")
+        def _():
+            """Cortical area is composed of layers of cells."""
+            pass
+
+        @doc.section("Introduction").illustration
+        def neocortical_scaffold():
+            """The neocortex is a 2-3 mm thick sheet of tissue."""
+            return "resources/neocortical_scaffold.png"
+
+        @doc.section("Introduction").tables
+        def experimental_cell_density():
+            """Mock experimental cell density."""
+            return {"data": "resources/experimental_cell_density.csv"}
+
+        @doc.section("cell_density")
+        def measurement():
+            """Layer cell densities for regions."""
+            pass
+
+        @doc.section("cell_density")
+        def illustration():
+            """Mock cell density plot."""
+            pass
+
+        assert len(doc.sections) == 3
+        assert "abstract" in doc.sections
+        assert "introduction" in doc.sections
+        assert "cell_density" in doc.sections
+
+        intro = doc.sections["introduction"]
+        assert intro.get_narrative() == "Cortical area is composed of layers of cells."
+        assert intro.get_function("illustration") is neocortical_scaffold
+        assert intro.get_function("tables") is experimental_cell_density
+
+        cd = doc.sections["cell_density"]
+        assert "measurement" in cd._functions
+        assert "illustration" in cd._functions
+#+end_src
+
+* Key Design Decisions
+
+| Decision                              | Rationale                                                         |
+|---------------------------------------+-------------------------------------------------------------------|
+| Plain class, not =WithFields=         | The builder is a construction tool, not a domain object.          |
+| =__getattr__= for known sections     | =document.introduction= feels natural to the scientist.          |
+| =SectionProxy.__call__= as decorator | The primary use case is =@document.section("X") def fn(): ...=    |
+| Properties for sub-element decorators | =@proxy.illustration= reads like English.                        |
+| Same proxy on repeated =.section()=  | Allows incremental decoration across multiple =@= statements.    |
+| Docstring as narrative                | Scientists write prose in docstrings naturally.                   |
+| Function name as disambiguation       | =measurement= vs =illustration= on the same section — no clash. |
+
+* Relationship to the Existing System
+
+The builder does /not/ replace the existing =Document=, =Section=, =LabReport=, or
+=WithFields= machinery. Those classes remain the runtime representation of a
+document. The builder is a /construction-time/ convenience that assembles the
+arguments needed to instantiate those classes.
+
+A future =build()= method on =DocumentBuilder= will translate accumulated proxies
+into actual =Section=, =Abstract=, =Methods=, etc. instances. For now, the builder
+is useful as a declaration surface — the test prototypes prove the API is ergonomic
+even before =build()= is implemented.
+
+* What Comes Next
+
+- *Lesson 01 — Field System*: The =WithFields= descriptor protocol that powers the
+  existing document classes. Understanding it is necessary before =build()= can
+  translate proxies into real objects.
+- *Lesson 02 — Document Lifecycle*: How =Narrative=, =Data=, and =Illustration=
+  mixins compose into =DocElem= and =Section=, and how =__call__= chains produce
+  evaluation records.
+- *Lesson 03 — The LabReport*: Building a full =LabReport= from decorated sections,
+  including measurements, reference data, and illustrations.
+
+* Requirements for Agents                                        :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 00-document-builder
+tag: lesson/00-document-builder
+files_created:
+  - src/dmt/document/builder.py
+  - test/test_builder.py
+verification:
+  - "python -c 'from dmt.document.builder import DocumentBuilder' succeeds"
+  - "pytest test/test_builder.py -v — all tests pass"
+next_lesson: 01-weather-scenario
+#+end_src
+
+* Local Variables                                                :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

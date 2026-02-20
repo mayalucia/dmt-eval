@@ -1,0 +1,1262 @@
+#+STARTUP: overview
+#+STARTUP: logdrawer
+
+#+OPTIONS: <:nil c:nil todo:nil H:5
+#+OPTIONS: toc:3
+
+#+title: DMT for the Age of AI Agents
+#+subtitle: A Comprehensive Report and Project Plan
+#+author: Vishal Sood
+#+date: February 2026
+
+* Executive Summary
+
+DMT (Data, Models, Tests) is a validation framework designed at Blue Brain
+Project over 2017--2024 by Vishal Sood. Its core architectural insight ---
+decoupling analyses from models through formal adapter interfaces, with
+structured scientific report generation --- solves a problem that has become
+acute across multiple domains in 2026.
+
+This report argues that DMT's proven architecture should be reborn as a modern,
+domain-agnostic validation framework. The primary target is AI/LLM model
+evaluation, where regulatory pressure (EU AI Act enforcement August 2026) and
+the absence of structured report generation create an immediate market
+opportunity. Secondary targets --- weather forecast validation, financial model
+risk management, and drug discovery --- face the identical structural problem
+and validate that DMT's patterns have cross-domain demand.
+
+BBP is dead. But the ideas that emerged from it are precisely what the world
+needs now.
+
+* Part I: The Opportunity
+
+** The Universal Validation Problem
+
+Every domain where computational models compete faces the same structural
+problem:
+
+1. *Multiple competing models* for the same prediction task
+2. *Reference/observation data* that models must be validated against
+3. *Regulatory or community pressure* for documented, reproducible validation
+4. *No clean adapter layer* separating validation logic from model
+   implementation
+5. *No structured report generation* --- just metrics, dashboards, or JSON
+
+DMT solved this at BBP for brain circuit models. The same architecture applies
+wherever models need systematic validation against empirical data.
+
+** Why Now?
+
+Three forces converge in 2026:
+
+*** EU AI Act Enforcement (August 2026)
+
+The EU AI Act's General Purpose AI (GPAI) provisions took effect August 2,
+2025. From August 2, 2026, the Commission gains enforcement powers: fines,
+requests for information, model access, and recalls. GPAI model providers must:
+
+- Perform model evaluations including adversarial testing
+- Prepare and maintain documentation describing training, testing processes,
+  and evaluation results
+- Any model trained using $\geq 10^{25}$ FLOPs faces additional obligations
+
+The AI Office itself recognizes the "immature state of external evaluation
+ecosystems." The Code of Practice (published July 10, 2025) is voluntary; the
+real teeth come in August 2026.
+
+*No existing evaluation framework produces structured, auditable documentation.*
+They produce dashboards, JSON, or pytest output. Regulators want /documents/.
+
+*** NIST and ISO Standardization
+
+- *NIST* released a "Proposed Zero Draft for a Standard on AI Testing,
+  Evaluation, Verification, and Validation (TEVV)" in July 2025
+- *ISO/IEC 42001* (AI management system standard) is becoming
+  enterprise-expected. Microsoft requires it for AI vendors.
+- The *International Network for Advanced AI Measurement* published consensus
+  on key practices in February 2026
+
+These are high-level frameworks deliberately leaving implementation details to
+industry. The space for a concrete, open-source implementation framework is
+wide open.
+
+*** The AI Weather Model Explosion
+
+The proliferation of AI weather models (GraphCast, GenCast, Pangu-Weather,
+FengWu, FuXi, AIFS) has created an urgent need for standardized validation.
+The WMO's Weather Prediction Model Intercomparison Project (WP-MIP) is
+explicitly trying to build what DMT already provides: a framework for comparing
+heterogeneous models against the same observations with standardized metrics
+and reporting.
+
+* Part II: Survey of Existing Evaluation Frameworks
+
+** AI/LLM Evaluation
+
+*** EleutherAI lm-evaluation-harness
+
+The de facto standard for academic LLM benchmarking. Used by NVIDIA, Cohere,
+BigScience, and as the backend for HuggingFace's Open LLM Leaderboard.
+
+- *Model Abstraction*: Clean adapter pattern via =lm_eval.api.model.LM= base
+  class. Since v0.4+, model backends are installed separately (=pip install
+  lm_eval[hf]=, =lm_eval[vllm]=).
+- *Report Generation*: /Weak/. JSON/CSV only. No human-readable reports.
+- *Extensibility*: Strong for tasks and model backends. Weak for non-standard
+  evaluation patterns (multi-turn, tool-use, agent evaluation).
+- *Non-LLM Support*: None. Expects text/logprob producing models.
+- *Limitation*: The =LM= base class assumes "prompt-in, text/logprob-out."
+  Cannot evaluate non-language models.
+
+*** UK AISI Inspect AI
+
+Open-source framework from the UK AI Safety Institute for reproducible LLM
+evaluations, with focus on safety and agent evaluation. MIT-licensed, 50+
+contributors including national AI safety institutes and frontier labs. Latest
+release February 12, 2026.
+
+- *Model Abstraction*: Pipeline architecture: Dataset -> Task -> Solver ->
+  Scorer. Model backends configured by string identifier (=openai/gpt-4=,
+  =anthropic/claude-3=). More "configured model reference" than formal adapter.
+- *Report Generation*: VS Code log viewer, web-based "Inspect View" dashboard.
+  Better than most, but no structured narrative reports.
+- *Extensibility*: Excellent. Custom Solvers, Scorers, Tasks. Docker/K8s
+  sandboxing for agent evaluation.
+- *Non-LLM Support*: Very limited. Architecture assumes text/conversation.
+- *Limitation*: No publishable reports. LLM-specific design.
+
+*** RAGAS (Retrieval Augmented Generation Assessment)
+
+Framework specifically for evaluating RAG pipelines. Reference-free evaluation
+using LLM-as-judge approaches.
+
+- *Model Abstraction*: None. Expects pre-computed outputs (questions, contexts,
+  answers, ground-truth). Evaluator LLMs support LangChain/LlamaIndex.
+- *Report Generation*: Minimal. Numerical metric scores only.
+- *Non-LLM Support*: No. RAG-specific.
+- *Limitation*: Narrow scope, no adapter pattern, no reporting.
+
+*** DeepEval (Confident AI)
+
+Pytest-like framework for "unit testing" LLM outputs. 50+ metrics, multi-modal
+support, cloud platform for collaboration.
+
+- *Model Abstraction*: LLM-as-a-Judge architecture. No formal adapter for the
+  model under test --- you pass test cases (input/output pairs).
+- *Report Generation*: Pytest-style output + cloud dashboards. No structured
+  narrative reports.
+- *Extensibility*: Strong. Custom metrics, G-Eval for arbitrary criteria,
+  synthetic dataset generation.
+- *Non-LLM Support*: No.
+
+*** promptfoo
+
+Developer-focused CLI toolkit for prompt engineering, testing, and red-teaming.
+YAML/JSON config-driven.
+
+- *Model Abstraction*: Model-agnostic via YAML provider configuration. Custom
+  providers as JS/TS modules.
+- *Report Generation*: Web-based comparison UI for A/B testing. Not archival.
+- *Non-LLM Support*: No. Prompt-centric.
+- *Limitation*: TypeScript/Node.js ecosystem. Not for Python-centric ML teams.
+
+*** OpenAI Evals
+
+OpenAI's evaluation framework (17,600 GitHub stars). Now includes "Trace Evals"
+for multi-step agent behavior and a no-code dashboard.
+
+- *Model Abstraction*: Shallow. Models must speak the OpenAI Chat Completions
+  API format. Multi-model supported but format-locked.
+- *Report Generation*: Dashboard UI only.
+- *Non-LLM Support*: No.
+- *Limitation*: OpenAI API format lock-in, increasingly dashboard-oriented.
+
+*** LangSmith (LangChain)
+
+Unified observability, debugging, and evaluation platform for LLM applications.
+
+- *Model Abstraction*: Observation-based. Traces whatever models you use within
+  LangChain. Not a model adapter pattern.
+- *Report Generation*: The "Insights Agent" (2025) generates natural-language
+  reports by analyzing production traces. One of few frameworks with narrative
+  reporting, but automated/descriptive, not structured/scientific.
+- *Non-LLM Support*: Minimal.
+- *Limitation*: LangChain ecosystem coupling. Paid for full features.
+
+*** Weights & Biases Weave
+
+W&B's LLM observability and evaluation platform.
+
+- *Model Abstraction*: Decorator-based (=@weave.op=). Auto-patches LLM
+  libraries. Observation pattern, not adapter pattern.
+- *Report Generation*: W&B dashboards and "Reports" feature. Interactive,
+  not structured documents.
+- *Non-LLM Support*: Partial. W&B core supports traditional ML, but Weave is
+  separate. Two evaluation systems that don't interoperate.
+- *Limitation*: Bifurcated eval systems.
+
+*** MLflow (GenAI + Traditional ML)
+
+Open-source platform from Databricks. Now has =mlflow.genai= for LLM evaluation
+alongside traditional ML evaluation.
+
+- *Model Abstraction*: *Two incompatible evaluation systems*.
+  =mlflow.models.evaluate()= with =EvaluationMetric= objects for
+  classification/regression. =mlflow.genai.evaluate()= with =Scorer= objects
+  for LLMs. They cannot be mixed.
+- *Report Generation*: Dashboards and visualizations. No structured narrative.
+- *Non-LLM Support*: Yes (traditional ML is mature), but bifurcated.
+- *Limitation*: The split is the key failure. Nobody has unified this.
+
+*** Giskard
+
+Open-source for detecting performance, bias, and security issues. Covers both
+LLMs and traditional ML for tabular data.
+
+- Working on v3 --- fresh rewrite for dynamic multi-turn agent testing.
+- Rare in covering both LLM and traditional ML.
+- Three components: open-source library, premium "AI Quality Hub," LLMon
+  real-time monitoring.
+
+*** Braintrust
+
+AI observability platform. Used by Notion, Stripe, Vercel, Airtable.
+
+- Integrates with OpenTelemetry, multiple agent SDKs.
+- "Brainstore" purpose-built database for 80x faster queries.
+- Generous free tier. Pro at $249/month.
+
+** Commercial/Enterprise Tools
+
+*** Arthur AI
+Open-sourced "Arthur Engine" in 2025. Real-time evaluation for GenAI and
+traditional ML. Active guardrails. "Agent Development Lifecycle (ADLC)"
+methodology. Monitored over 1 billion tokens in 2025.
+
+*** Patronus AI
+Key product: Lynx --- evaluation model outperforming GPT-4 in hallucination
+detection across medical and financial domains. Proprietary evaluation models,
+not wrappers around GPT-4.
+
+*** Galileo AI
+$45M Series B. "ChainPoll" multi-model consensus for near-human accuracy.
+"Luna" suite of fine-tuned small LMs for specific evaluation tasks (runs
+locally). Agentic evaluations launched January 2025.
+
+*** ValidMind
+Purpose-built Model Risk Management platform for regulated industries.
+Experian partnership February 2025. General Bank of Canada reported 70%
+reduction in validation time. Targets SR 11-7 compliance.
+
+*** Deepchecks
+Agent evaluation via sub-task decomposition. SOC2 Type 2, GDPR, HIPAA
+compliant. Flexible deployment options.
+
+** Summary: The Competitive Landscape
+
+| Framework            | Adapter Pattern       | Report Gen      | Non-LLM | Regulatory Docs |
+|----------------------+-----------------------+-----------------+---------+-----------------|
+| lm-eval-harness      | LM base (LLM-only)   | JSON/CSV        | No      | No              |
+| Inspect AI           | String model config   | Dashboards      | No      | No              |
+| RAGAS                | None                  | Scores          | No      | No              |
+| DeepEval             | None (test cases)     | Pytest + cloud  | No      | No              |
+| promptfoo            | YAML config           | Web UI          | No      | No              |
+| OpenAI Evals         | Chat API format       | Dashboard       | No      | No              |
+| LangSmith            | LangChain traces      | Insights Agent  | Minimal | No              |
+| W&B Weave            | Decorator tracing     | Dashboards      | Partial | No              |
+| MLflow               | Two incompatible APIs | Dashboards      | Split   | No              |
+| Giskard              | Library calls         | Hub UI          | Yes     | Partial         |
+| *DMT (proposed)*     | *Formal Protocol*     | *LabReport*     | *Yes*   | *Yes*           |
+
+The gap is clear: *no existing framework combines a formal model-agnostic
+adapter pattern with structured report generation and non-LLM support.*
+
+* Part III: Cross-Domain Analysis
+
+** Weather / Climate Forecast Validation
+
+*** Existing Tools
+
+- *METplus* (NCAR/NOAA): Most comprehensive operational verification framework.
+  Multi-component Python-wrapper suite around MET engine. The Met Office is
+  replacing its legacy VER system with METplus. Monolithic architecture, not
+  designed for lightweight multi-model comparison.
+
+- *scores* (Australian Bureau of Meteorology / NCI): Newer Python package
+  (JOSS 2024). 50+ metrics including novel scores (FIRM, Flip-Flop Index,
+  threshold-weighted CRPS). Works with xarray and pandas. Every metric has a
+  companion Jupyter notebook tutorial.
+
+- *xskillscore*: Deterministic and probabilistic verification metrics on
+  xarray. Wraps =properscoring=.
+
+- *climpred*: Builds on xskillscore for ensemble prediction verification.
+  =PerfectModelEnsemble= and =HindcastEnsemble= analysis classes. Dask for
+  out-of-memory computation.
+
+*** The AI Weather Model Explosion
+
+ML-based weather models have transformed the landscape:
+
+- *GraphCast* (Google DeepMind): Outperforms Pangu-Weather on 99.2% of targets
+- *GenCast* (Google DeepMind): Probabilistic ensemble at 0.25-degree resolution
+- *Pangu-Weather* (Huawei): Pioneer, now outperformed
+- *FengWu*, *FuXi*: Strong in Eastern Asia evaluations
+- *AIFS* (ECMWF): ECMWF's own ML model
+
+A 2025 AIES paper showed ML models achieve similar local accuracy to HRES on
+extreme events but underperform on spatiotemporal aggregation.
+
+*** WMO Standardization: WP-MIP
+
+The Weather Prediction Model Intercomparison Project (WP-MIP) has two streams:
+- *SIC* (Same Initial Conditions): Forecasts from ECMWF analysis grids
+- *OIC* (Own Initial Conditions): Operational configurations
+
+WMO tables version 36 with WPMIP-specific keys released late 2025.
+
+*** Where DMT's Architecture Applies
+
+1. *No adapter pattern*: Each model (GFS, ECMWF IFS, GraphCast, GenCast, AIFS)
+   produces output in different formats (GRIB, NetCDF, Zarr, custom tensors).
+   Every validation study writes its own data loading and regridding code.
+
+2. *Coupled metrics and data handling*: METplus, xskillscore, scores, climpred
+   each assume their own data format conventions. No Interface/Adapter
+   separation.
+
+3. *Reproducibility of multi-model comparison*: WP-MIP is trying to
+   standardize this at the WMO level, but individual researchers face enormous
+   friction comparing 5+ models.
+
+4. *No report generation*: =scores= has Jupyter notebooks per metric, but no
+   structured "validation report" framework. DMT's Document system is exactly
+   what's missing.
+
+** Financial Model Validation
+
+*** Regulatory Framework
+
+*SR 11-7* (Federal Reserve, 2011) remains the cornerstone of Model Risk
+Management in the US. Three pillars: model development/documentation,
+independent model validation, governance/controls. Regulators now apply SR 11-7
+principles to AI/ML and Generative AI models.
+
+*Basel IV* took effect in the EU January 1, 2025. FRTB delayed to January
+2026. US implementation uncertain, final rules expected mid-2026.
+
+*** Existing Tools
+
+Backtesting frameworks:
+- *VectorBT*: Fastest (vectorized via NumPy/Numba), best for systematic
+  quantitative research
+- *Backtrader*: Event-driven, most realistic market simulation
+- *Zipline*: Effectively legacy/unmaintained
+- *NautilusTrader*: Emerging production-grade alternative
+
+Enterprise platforms:
+- *ValidMind*: Purpose-built MRM platform. Experian partnership. 70% validation
+  time reduction reported. Targets SR 11-7.
+- *ModelOp*: IDC MarketScape Major Player for AI Governance (2025). First
+  comprehensive Agentic AI governance tooling.
+
+*** Where DMT's Architecture Applies
+
+1. *Model-agnostic validation is the regulatory requirement*: SR 11-7 demands
+   independent validation separate from development. This is literally the
+   Adapter pattern.
+
+2. *Documentation automation gap*: Examiners require extensive documentation.
+   ValidMind addresses this for banks, but there is no open-source equivalent.
+   DMT's Report architecture maps directly.
+
+3. *Multi-model comparison*: Banks run multiple models for the same risk
+   factor. DMT's =StructuredAnalysis= with =reference_data= and
+   =get_model_measurements= is exactly this pattern.
+
+4. *No open-source bridge*: VectorBT/Backtrader handle backtesting.
+   ValidMind/ModelOp handle governance. Nothing connects "run model, compare to
+   actuals, generate compliant report" in a single open pipeline.
+
+** Drug Discovery / Biomedical
+
+*** Regulatory Framework
+
+OECD guidelines require QSAR models to pass internal validation (LOO, k-fold,
+bootstrapping) and external validation (held-out test sets). Y-randomization
+mandatory. Advanced techniques include Monte Carlo sampling, double
+cross-validation, and consensus modeling.
+
+*** Existing Frameworks
+
+- *ProQSAR* (2025): Modular, reproducible workbench with interchangeable
+  modules for standardization, feature generation, scaffold-aware splitting,
+  preprocessing, outlier handling, scaling, feature selection, model
+  training/tuning, statistical comparison, conformal calibration, and
+  applicability-domain assessment. *This independently reinvented DMT's
+  architecture.* Validates the pattern.
+
+- *PoseidonQ*: 22 ML algorithms, 17 fingerprint types, 208 RDKit descriptors.
+- *QSARtuna*: Automated QSAR modeling platform.
+- *PharmaBench*: LLM-enhanced ADMET benchmarking.
+- *TDC* (Therapeutics Data Commons): 66 datasets, 22 learning tasks, 33 data
+  functions, 29 leaderboards. TDC-2 adds multimodal foundation model
+  benchmarking.
+
+*** ADMET Prediction Reproducibility Crisis
+
+Documented pain point: inconsistent data quality and lack of standardization
+across heterogeneous ADMET datasets undermine model reproducibility. Over 20
+ADMET prediction platforms exist with no standardized comparison framework.
+
+*** Where DMT's Architecture Applies
+
+1. *Reproducibility crisis explicitly documented*: The community calls out
+   "establishing standardized benchmarks and interpretability metrics" as
+   crucial.
+
+2. *ProQSAR already reinvented DMT*: Its modular pipeline mirrors DMT's
+   component-based =StructuredAnalysis=. This independently validates demand.
+
+3. *No unified adapter for molecular models*: QSAR, deep learning, GNN, and
+   docking models all have different interfaces.
+
+4. *Regulatory documentation for drug models*: OECD validation guidelines
+   require structured documentation. Maps to DMT's LabReport.
+
+** Cross-Domain Summary
+
+| Pattern                                   | Weather         | Finance         | Drug Discovery | AI/LLM          |
+|-------------------------------------------+-----------------+-----------------+----------------+-----------------|
+| Multiple competing models                 | GFS, GraphCast  | PD/LGD models   | QSAR, GNN      | GPT, Claude     |
+| Compare against reference data            | ERA5, stations  | Market actuals  | Assays, trials | Human judgments  |
+| Regulatory documentation required         | WMO, national   | SR 11-7, Basel  | OECD, FDA      | EU AI Act       |
+| Structured reports required               | WP-MIP outputs  | MRM docs        | OECD 5 rules   | GPAI compliance |
+| Model-agnostic interface needed           | Different formats| Different APIs  | Different reps | Different APIs  |
+| *Existing solution?*                      | *No*            | *SaaS only*     | *No*           | *No*            |
+
+*The pattern is universal. The solution does not exist.*
+
+* Part IV: What DMT Brings to the Table
+
+** The Architecture That Nobody Else Has
+
+DMT's architecture, developed over 7 years of real-world use, provides three
+capabilities that are genuinely absent from every surveyed framework:
+
+*** 1. Formal Adapter Interface Pattern
+
+DMT uses Python metaclasses (=AIMeta=, =InterfaceMeta=) to automatically
+extract interface methods (marked with =@interfacemethod=) and compose them
+across inheritance hierarchies. The =adapter.setter= validates that a provided
+adapter fully implements the required interface.
+
+The key insight: *the same analysis code can evaluate fundamentally different
+model types* --- a brain simulation, an LLM, a weather model, a QSAR model ---
+by swapping adapters.
+
+No current framework does this. The closest is lm-eval-harness's =LM= class,
+but it assumes the model produces text/logprobs. DMT's adapter interface makes
+no assumptions about what the model produces.
+
+*Modernization path*: Replace metaclasses with =typing.Protocol= + runtime
+validation. Same power, cleaner syntax, better tooling support.
+
+*** 2. Structured Narrative Report Generation
+
+DMT's =LabReport= class with =Abstract/Introduction/Methods/Results/Discussion/
+Conclusion= structure produces complete scientific documents, not just metrics.
+The =Section= class supports template-based content with model-specific values
+substituted at runtime. The =save()= method serializes to disk in an organized
+folder structure.
+
+*This is what regulatory compliance demands.* The EU AI Act requires
+"documentation describing the model's training and testing processes and
+evaluation results." SR 11-7 requires documented validation methodology.
+Dashboards are not documentation. JSON files are not documentation.
+
+*** 3. Parameterized Measurement as First-Class Concept
+
+DMT's =Measurement= class encodes:
+- =parameters=: the conditions to vary (temperature, pressure, brain region,
+  prompt category, lead time, asset class)
+- =method=: the function that performs a single measurement
+- =collection=: how to aggregate results across parameter sets
+- =sample_size=: statistical rigor
+
+This is standard in computational science but completely absent from the LLM
+evaluation world. Current frameworks treat evaluation as "run prompts, get
+scores." DMT treats it as a systematic experimental protocol.
+
+** What Carries Over (the ideas)
+
+1. *Adapter interfaces* --- the same analysis runs on any model via adapters
+2. *Measurement as first-class* --- parameterized sweeps with collection policies
+3. *LabReport structure* --- scientific document with sections
+4. *Composable analysis sections* --- Narrative + Data + Illustration mixins
+5. *Three-party architecture* --- data providers, model adapters, validation
+   writers work independently
+6. *Verdict with statistical rigor* --- not just metrics, but "does this pass?"
+
+** What Gets Modernized
+
+| DMT (2017--2024)                    | New framework (2026)             |
+|-------------------------------------+----------------------------------|
+| Metaclasses (=AIMeta=, =InterfaceMeta=) | =typing.Protocol= + runtime check |
+| =WithFields= descriptor system     | =dataclasses= or =attrs=         |
+| Cheetah3 templates                  | Jinja2 templates                 |
+| Neuroscience-coupled (=neuro_dmt=)  | Domain-agnostic core + domain packs |
+| No CLI                              | =typer= or =click= CLI           |
+| No packaging                        | =pyproject.toml=, =uv=, PyPI     |
+| Python 3.6 era                      | Python 3.11+                     |
+| No web output                       | Markdown, HTML, PDF, LaTeX       |
+
+* Part V: Project Plan
+
+** Naming
+
+The project should keep the DMT identity. Options:
+
+| Name               | PyPI available? | Notes                              |
+|--------------------+-----------------+------------------------------------|
+| =dmt=              | No (taken)      | "Domain Management Tool" for RASA  |
+| =dmt-val=          | Likely yes      | Short, clear                       |
+| =dmt-validation=   | Yes             | Explicit                           |
+| =dmt-eval=         | Yes             | Aligns with "eval" convention      |
+| =DMT-core=         | No (taken)      | Semiconductor Device Modeling Toolkit |
+
+*Recommendation*: Keep the GitHub repo as =visood/dmt=. For the PyPI package,
+use =dmt-eval= (short, aligns with the eval ecosystem convention, clearly
+communicates purpose).
+
+Import name: =import dmt=
+
+** Architecture
+
+#+begin_src
+dmt/
+├── __init__.py
+├── interface.py        # Protocol-based interfaces
+├── adapter.py          # Adapter base + registry
+├── analysis.py         # Analysis base class
+├── measurement.py      # Parameterized measurement + collection
+├── verdict.py          # Statistical verdict (pass/fail with confidence)
+├── document/           # Report generation
+│   ├── __init__.py
+│   ├── report.py       # LabReport structure
+│   ├── section.py      # Narrative + Data + Illustration composition
+│   ├── narrative.py    # Jinja2 template-based text
+│   └── renderers/      # Output format renderers
+│       ├── markdown.py
+│       ├── html.py
+│       ├── pdf.py
+│       └── latex.py
+├── cli.py              # Command-line interface
+└── domains/            # Domain-specific adapter packs (optional installs)
+    ├── llm/            # pip install dmt-eval[llm]
+    │   ├── adapters/   # OpenAI, Anthropic, HuggingFace, local models
+    │   ├── metrics/    # Accuracy, coherence, hallucination, safety
+    │   └── reports/    # EU AI Act template, model card template
+    ├── weather/        # pip install dmt-eval[weather]
+    │   ├── adapters/   # GraphCast, ECMWF, GFS, xarray-native
+    │   ├── metrics/    # RMSE, CRPS, skill scores
+    │   └── reports/    # WP-MIP template
+    ├── finance/        # pip install dmt-eval[finance]
+    │   ├── adapters/   # Backtesting, risk model, pricing model
+    │   ├── metrics/    # Sharpe, drawdown, VaR backtest
+    │   └── reports/    # SR 11-7 template, Basel template
+    └── pharma/         # pip install dmt-eval[pharma]
+        ├── adapters/   # QSAR, GNN, docking model
+        ├── metrics/    # OECD validation metrics
+        └── reports/    # OECD template
+#+end_src
+
+** Phased Roadmap
+
+*** Phase 1: Core + AI Eval (Weeks 1--6)
+
+The highest demand, fastest adoption path.
+
+*Deliverables*:
+1. Core framework: Interface (Protocol-based), Adapter, Measurement, Report
+2. LLM domain pack with adapters for OpenAI, Anthropic, HuggingFace
+3. LabReport rendering to Markdown + HTML
+4. Basic CLI: =dmt run=, =dmt report=
+5. PyPI release as =dmt-eval=
+6. MkDocs Material documentation
+7. GitHub repo (=visood/dmt=, made public)
+
+*Key design decisions*:
+- =typing.Protocol= for interfaces (no metaclass magic)
+- =dataclasses= for field declarations (familiar to all Python developers)
+- Jinja2 for templates (widely known, well-supported)
+- pandas for data handling (continuity with original DMT)
+- pytest integration for running evals as tests
+
+*First demo*: "Evaluate GPT-4 vs Claude vs Llama on a custom benchmark in 10
+lines of code. Get a structured compliance report."
+
+*** Phase 2: Reports + Weather (Weeks 7--12)
+
+*Deliverables*:
+1. PDF/LaTeX report rendering
+2. EU AI Act compliance report template
+3. ISO 42001 audit artifact template
+4. Weather domain pack (xarray-native)
+5. Adapters for GraphCast, ECMWF IFS, GFS
+6. WP-MIP metric alignment
+
+*** Phase 3: Finance + Pharma (Weeks 13--20)
+
+*Deliverables*:
+1. Finance domain pack
+2. SR 11-7 report template
+3. Backtesting adapter integration
+4. Pharma domain pack
+5. OECD validation templates
+6. QSAR model adapters
+
+*** Phase 4: Ecosystem (Weeks 21--30)
+
+*Deliverables*:
+1. HuggingFace integration (eval results as model cards)
+2. LangChain/LlamaIndex tool integration
+3. MCP server for agent-callable analyses
+4. Adapter registry / plugin system for community contributions
+5. JOSS paper submission
+6. arXiv preprint on "model-agnostic validation architecture"
+
+** Dissemination Strategy
+
+*** Package Distribution
+
+- =pyproject.toml= with =uv= as build/dependency tool
+- =src= layout: =src/dmt/=
+- Trusted PyPI publishing via GitHub Actions
+- Domain packs as optional extras: =pip install dmt-eval[llm,weather]=
+
+*** Documentation
+
+- MkDocs Material (the current standard for Python projects)
+- Hosted on GitHub Pages or Read the Docs
+- "Getting Started in 5 Minutes" as the landing page
+- Domain-specific tutorials (AI eval, weather, finance)
+- API reference auto-generated from docstrings
+
+*** Community Building
+
+Where to engage:
+- *Twitter/X*: Primary discovery channel for ML practitioners
+- *Reddit* r/MachineLearning, r/LocalLLaMA: Technical audience
+- *HuggingFace*: Spaces demo, community discussions
+- *Discord*: Project community server
+- *LinkedIn*: Professional/enterprise audience (especially for regulatory angle)
+
+What catches on (patterns from successful recent frameworks):
+- *instructor* (Jason Liu): Compelling README, Twitter threads, real pain point
+- *outlines* (.txt): Academic paper + open-source, caught HuggingFace wave
+- *dspy* (Stanford): Academic credibility + practical tooling
+- *pydantic-ai*: Rode the pydantic brand + clear value proposition
+
+Key insight: *frameworks that catch on solve a genuine, acute pain point and
+make the first 5 minutes of usage effortless.* The founder typically spends
+~50% of time on outreach and community engagement.
+
+*** Academic Publication
+
+1. *JOSS (Journal of Open Source Software)*: Low barrier, peer-reviewed,
+   gives the framework a citable DOI. Ideal for Phase 4.
+2. *arXiv preprint*: "DMT: A Model-Agnostic Validation Architecture for
+   the Age of AI Agents" --- establishes intellectual priority.
+3. *Conference workshops*: NeurIPS (Evaluation workshop), ICML, PyCon
+4. *Domain-specific venues*: AMS for weather, JCIM for drug discovery
+
+*** The Regulatory Angle (Enterprise Adoption Driver)
+
+Blog posts and talks targeting:
+- "EU AI Act compliance for GPAI providers: a practical guide"
+- "Automated model documentation for ISO 42001 certification"
+- "Open-source model risk management for fintechs"
+
+This is the content that drives enterprise adoption. Dashboards are sexy
+but documentation is mandatory.
+
+*** Integration Strategy
+
+Grow by plugging into existing ecosystems:
+- HuggingFace model cards (eval results auto-populate)
+- LangChain/LlamaIndex (DMT analyses as tools)
+- MCP (analyses callable by AI agents)
+- W&B / MLflow (DMT reports as artifacts)
+- pytest (=dmt= evals run alongside unit tests)
+
+*** Monetization (Optional, Future)
+
+If warranted:
+- *Open core*: Core framework free. Premium report templates, enterprise
+  integrations, hosted dashboard.
+- *Consulting*: Regulatory compliance consulting using DMT tooling.
+- *Cloud-hosted*: SaaS version for teams that don't want to self-host.
+
+* Part VI: Domain-Specific Opportunity Analysis
+
+** Ranking by Opportunity
+
+*** 1. AI/LLM Evaluation (Highest, Immediate)
+
+- *Demand*: Every company evaluating AI models
+- *Regulatory driver*: EU AI Act (August 2026 enforcement)
+- *Competition*: Many tools, but none with structured reports + adapter pattern
+- *Differentiation*: Report generation is the killer feature
+- *Time to market*: 6 weeks to MVP
+
+*** 2. Weather/Climate (High, Strategic)
+
+- *Demand*: WP-MIP initiative explicitly needs this
+- *No commercial incumbent*: Unlike finance (ValidMind) or AI (many tools)
+- *Python ecosystem mature*: xarray, dask, scores provide building blocks
+- *AI weather model proliferation*: 5+ serious contenders creates urgency
+- *Community*: Weather/climate community is collaborative, open-source friendly
+- *Differentiation*: Adapter layer + reports over existing metric libraries
+
+*** 3. Financial Services (High, Enterprise-Locked)
+
+- *Demand*: Proven (ValidMind raised $8.1M, Experian partnership)
+- *Regulatory driver*: SR 11-7, Basel IV
+- *Competition*: ValidMind/ModelOp are SaaS, no open-source equivalent
+- *Opportunity*: Fintechs, quant researchers, smaller institutions
+- *Barrier*: Enterprise sales cycle, compliance certification requirements
+
+*** 4. Drug Discovery (Medium-High, Validation Needed)
+
+- *Demand*: ProQSAR's 2025 emergence validates the pattern
+- *Regulatory driver*: OECD validation guidelines
+- *Complexity*: Molecular representation diversity makes adapter layer harder
+- *Community*: Cheminformatics community, active on RDKit/DeepChem
+- *Opportunity*: Unify the 20+ ADMET prediction platforms
+
+** The Multi-Domain Play
+
+The real power of DMT's architecture is that the /core/ is domain-agnostic.
+An =Analysis= that measures RMSE of predictions vs. observations doesn't
+care whether the predictions come from a weather model or an LLM. The domain
+pack just provides:
+
+1. Adapters that know how to extract data from domain-specific models
+2. Metrics that encode domain-specific scoring conventions
+3. Report templates that match domain regulatory requirements
+
+This means a single framework can credibly serve all four domains. No other
+tool does this. MLflow tried and ended up with two incompatible eval systems.
+
+* Part VII: Why This Will Work
+
+** DMT's ideas are independently being reinvented
+
+- *ProQSAR* (drug discovery, 2025) reinvented the modular pipeline
+- *WP-MIP* (weather, 2025) is building exactly what DMT provides
+- *ValidMind* (finance, 2025) is the SaaS version of DMT's architecture
+- Every AI eval framework is building ad-hoc adapter patterns
+
+When multiple communities independently converge on the same architecture, that
+architecture has real structural demand.
+
+** The regulatory window is real
+
+EU AI Act enforcement in August 2026 creates a hard deadline. Organizations
+need tools that produce /documents/, not dashboards. NIST TEVV standards are
+under development. ISO 42001 is being mandated. This is not speculative
+demand --- it is regulatory obligation.
+
+** The gap is specific and addressable
+
+It's not "build a better eval framework." It's:
+1. Model-agnostic adapter pattern (no existing tool has this properly)
+2. Structured report generation (no existing tool does this)
+3. Unified evaluation across model types (no existing tool achieves this)
+
+Three concrete, implementable differentiators.
+
+** You've already done this once
+
+7 years building and using DMT at BBP proves the architecture works in
+practice, not just in theory. The patterns have been stress-tested against
+real-world complexity. The new project extracts the proven ideas and rebuilds
+with modern Python tooling.
+
+* Conclusion
+
+BBP is dead. DMT's ideas are alive and urgently needed across multiple domains.
+The convergence of AI model proliferation, regulatory pressure, and the absence
+of structured validation reporting creates a specific, time-bounded opportunity.
+
+The path forward:
+1. Rebuild DMT's core architecture with modern Python (Protocol, dataclasses)
+2. Launch with AI eval as the primary domain (highest demand, fastest adoption)
+3. Expand to weather, finance, pharma as domain packs
+4. Publish a JOSS paper and build community
+5. Target regulatory compliance as the enterprise adoption driver
+
+The framework should ship as =dmt-eval= on PyPI, living in =visood/dmt= on
+GitHub. The first release should demonstrate: "10 lines of code. Any model.
+Auditable report."
+
+* Part VIII: Interface Design --- The Make-or-Break
+
+** Lessons from Successful Frameworks
+
+Studying the APIs of pytest, pydantic, instructor, dspy, deepeval, inspect-ai,
+lm-eval-harness, ragas, pandera, and attrs reveals six universal ergonomic
+patterns that drive adoption:
+
+*** Pattern 1: Declaration IS Configuration
+
+Every successful framework uses Python's own syntax as the configuration
+language. There is no external config format to learn.
+
+- *Type annotations* = schema (pydantic, pandera, attrs, dspy)
+- *Function names* = test discovery (pytest)
+- *Docstrings* = prompts/descriptions (dspy Signatures, inspect-ai =@tool=)
+- *Decorators* = registration/metadata (pytest, inspect-ai, ragas, attrs)
+
+*** Pattern 2: Minimal-to-Maximal Gradient
+
+Every framework has a 3-line entry point AND a 100-line power-user mode. The
+user is never forced to learn the complex version before using the simple one.
+
+- pytest: bare =assert= --> =@parametrize= --> fixtures --> plugins
+- pydantic: =class M(BaseModel): x: int= --> validators --> custom types
+- dspy: ="question -> answer"= --> =class Signature= --> =class Module= --> =MIPROv2.compile()=
+- pandera: =DataFrameSchema({})= --> =DataFrameModel= --> =@check_input=
+
+*** Pattern 3: Composition over Inheritance
+
+Flat composition wins over deep inheritance hierarchies:
+
+- inspect-ai: =solver=[system_message(...), generate()]= --- list of steps
+- deepeval: =assert_test(test_case, [metric1, metric2])= --- list of metrics
+- dspy: Module contains sub-modules, =forward()= composes them
+- pytest: fixtures inject into fixtures --- dependency graph
+
+*** Pattern 4: Factory Functions over Class Ceremony
+
+Users prefer calling =exact()= over =ExactScorer()=:
+
+- inspect-ai: =exact()=, =generate()=, =model_graded_fact()=
+- dspy: =dspy.ChainOfThought(...)=, =dspy.Predict(...)=
+- lm-eval: =simple_evaluate(model="hf", tasks=["hellaswag"])=
+
+*** Pattern 5: Strings for Simple, Classes for Complex
+
+Let users start with strings and graduate to classes only when needed:
+
+- dspy: ="question -> answer"= vs =class Classify(dspy.Signature)=
+- lm-eval: =tasks=["hellaswag"]= vs =Task= objects
+- instructor: ="openai/gpt-4o-mini"= vs pre-initialized client
+
+*** Pattern 6: Decorator = Registration
+
+Decorators are the universal mechanism for marking intent:
+
+- =@task= (inspect-ai) --- discoverable from CLI
+- =@tool= (inspect-ai) --- docstring becomes LLM tool description
+- =@define= (attrs) --- transforms a plain class
+- =@pytest.fixture= --- registers a dependency provider
+- =@pytest.mark.parametrize= --- multiplies test cases
+
+** What's Wrong with DMT's Current Interface
+
+DMT's current API requires users to understand three foundational systems
+(Interface metaclasses, Adapter decorators, WithFields descriptors) before
+writing their first analysis. The minimum conceptual load to get started is
+too high.
+
+*** The Current "Hello World" (Too Many Concepts)
+
+#+begin_src python
+from dmt.model import AIBase, interfacemethod
+from dmt.model.adapter import adapts
+from dmt.model.interface import implements
+from dmt.tk.field import WithFields, Field
+from dmt.analysis import Analysis
+
+# 1. Define interface (concept: metaclass, interfacemethod)
+class MyAnalysis(Analysis):
+    phenomenon = Field("What we study", __default_value__="density")
+
+    @interfacemethod
+    def get_density(adapter, model, region):
+        raise NotImplementedError
+
+    def __call__(self, adapter, model):
+        value = adapter.get_density(model, region="cortex")
+        return value
+
+# 2. Write adapter (concept: adapts decorator, implements decorator)
+@adapts(SomeModel)
+@implements(MyAnalysis.AdapterInterface)
+class SomeModelAdapter:
+    def get_density(self, model, region):
+        return model.internal_api.compute(region)
+
+# 3. Wire and run
+analysis = MyAnalysis()
+model = SomeModel()
+adapter = SomeModelAdapter()
+analysis.adapter = adapter
+result = analysis(adapter, model)
+#+end_src
+
+*Concepts required before first run*: Interface, interfacemethod, adapts,
+implements, WithFields, Field, AdapterInterface, Analysis, adapter.setter.
+That's 9 concepts. pytest requires 1 (=assert=).
+
+** The Design Goal
+
+DMT's new interface must satisfy:
+
+1. *3-line hello world* --- a user should see value in under a minute
+2. *No inheritance required for simple cases* --- functions first, classes when needed
+3. *Adapter pattern preserved but deferred* --- powerful when you need it,
+   invisible when you don't
+4. *Report generation as the reward* --- the structured report is what you get
+   for using DMT instead of a bare script
+5. *pytest-compatible* --- evals run with =pytest=, not a custom runner
+6. *Strings for simple, protocols for complex* --- gradual typing
+
+** The Proposed Interface
+
+*** Level 0: One Function (The "Hello World")
+
+#+begin_src python
+import dmt
+
+result = dmt.evaluate(
+    model="openai/gpt-4o",
+    dataset=[
+        {"input": "What is 2+2?", "expected": "4"},
+        {"input": "Capital of France?", "expected": "Paris"},
+    ],
+    metrics=["accuracy", "latency"],
+)
+
+print(result)           # Summary table
+result.report("./out")  # Generates Markdown report
+#+end_src
+
+*Concepts required*: 0 new concepts. Just a function call.
+This is the lm-eval-harness =simple_evaluate= pattern.
+
+*** Level 1: Pytest Integration (The Common Case)
+
+#+begin_src python
+import dmt
+from dmt.metrics import accuracy, coherence
+
+@dmt.eval(model="openai/gpt-4o", metrics=[accuracy, coherence(threshold=0.7)])
+def test_customer_support():
+    return [
+        dmt.Case(input="Return policy?", expected="30-day refund"),
+        dmt.Case(input="Track order?", expected="Use order number"),
+    ]
+#+end_src
+
+Run: =pytest test_eval.py=
+
+*Concepts required*: =@dmt.eval= decorator, =dmt.Case=, metric objects.
+This follows deepeval's pytest integration pattern.
+
+*** Level 2: Multiple Models (The Power User)
+
+#+begin_src python
+import dmt
+from dmt.metrics import accuracy, hallucination
+
+models = ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "local/llama-3.1-8b"]
+dataset = dmt.Dataset.from_csv("evals/customer_support.csv")
+
+result = dmt.compare(
+    models=models,
+    dataset=dataset,
+    metrics=[accuracy, hallucination],
+)
+
+result.report("./comparison", format="html")  # Side-by-side comparison report
+#+end_src
+
+*Concepts required*: =dmt.compare=, =dmt.Dataset=.
+This is what no existing framework does well: structured multi-model comparison
+with report output.
+
+*** Level 3: Custom Adapter (The DMT Differentiator)
+
+When your model isn't an LLM, or has a non-standard API:
+
+#+begin_src python
+import dmt
+import xarray as xr
+
+@dmt.adapter("graphcast")
+def graphcast_adapter(model_path: str):
+    """Adapter for Google's GraphCast weather model."""
+    data = xr.open_zarr(model_path)
+    return data
+
+@dmt.adapter("graphcast")
+def get_temperature_2m(model, lat: float, lon: float, lead_time: int):
+    """Extract 2m temperature prediction."""
+    return model["t2m"].sel(latitude=lat, longitude=lon, step=lead_time).values
+
+# Now use it like any other model
+result = dmt.evaluate(
+    model="graphcast:///path/to/forecast.zarr",
+    dataset=weather_obs,
+    metrics=["rmse", "bias", "skill_score"],
+)
+result.report("./weather_eval")
+#+end_src
+
+*Concepts required*: =@dmt.adapter= decorator. Function docstring becomes
+interface documentation. No metaclasses, no =Interface= class, no
+=@implements=.
+
+This is the inspect-ai =@tool= pattern: a decorator + docstring is all you
+need.
+
+*** Level 4: Parameterized Measurement (DMT's Unique Power)
+
+#+begin_src python
+import dmt
+
+@dmt.measurement(
+    parameters={"region": ["SSCx", "V1", "CA1"],
+                 "layer": ["L1", "L2/3", "L4", "L5", "L6"]},
+    sample_size=10,
+)
+def cell_density(adapter, model, region: str, layer: str) -> float:
+    """Measure cell density in a specific region and layer."""
+    return adapter.get_cell_density(model, region=region, layer=layer)
+
+result = cell_density.run(adapter, model)          # Runs all parameter combinations
+result.report("./density_analysis")                 # LabReport with data + plots
+#+end_src
+
+*Concepts required*: =@dmt.measurement= decorator with =parameters=.
+This is pytest's =@parametrize= pattern applied to scientific measurement.
+
+*** Level 5: Full LabReport (The Scientific Document)
+
+#+begin_src python
+import dmt
+
+report = dmt.LabReport("Cell Density Validation")
+
+@report.introduction
+def intro():
+    """The cortex is organized into layers with varying cell densities."""
+    pass
+
+@report.methods
+def methods():
+    """We measure cell density across regions using volumetric sampling."""
+    pass
+
+@report.results
+@dmt.measurement(parameters={"region": regions, "layer": layers})
+def density_results(adapter, model, region, layer):
+    """Cell density measurements."""
+    return adapter.get_cell_density(model, region=region, layer=layer)
+
+@report.results.illustration
+def density_plot(data):
+    """Cell density by layer across brain regions."""
+    return dmt.plot.bars(data, x="layer", y="density", group="region")
+
+@report.discussion
+def discussion(results):
+    """Model {{model_name}} shows good agreement in layers L4-L6
+    but underestimates density in superficial layers."""
+    pass
+
+# Generate
+report.run(adapter, model)
+report.save("./validation_report", format=["markdown", "html", "pdf"])
+#+end_src
+
+*Concepts required*: =dmt.LabReport= with section decorators. This is DMT's
+existing DocumentBuilder pattern, cleaned up.
+
+The function docstring becomes the narrative text. The decorator nesting
+(=@report.results.illustration=) creates the document hierarchy. Jinja2
+=\{\{model_name\}\}= templates replace the old =\model{...}= syntax.
+
+*** Level 6: Protocol-Based Interfaces (For Framework Authors)
+
+When you need formal contracts between teams:
+
+#+begin_src python
+from typing import Protocol, runtime_checkable
+import dmt
+
+@runtime_checkable
+class WeatherModelInterface(Protocol):
+    """Contract for weather model adapters."""
+
+    def get_temperature_2m(self, lat: float, lon: float, lead_time: int) -> float:
+        """2-meter temperature forecast."""
+        ...
+
+    def get_pressure(self, lat: float, lon: float, lead_time: int) -> float:
+        """Surface pressure forecast."""
+        ...
+
+@dmt.adapter(implements=WeatherModelInterface)
+class GraphCastAdapter:
+    def __init__(self, zarr_path: str):
+        self.data = xr.open_zarr(zarr_path)
+
+    def get_temperature_2m(self, lat, lon, lead_time):
+        return float(self.data["t2m"].sel(latitude=lat, longitude=lon, step=lead_time))
+
+    def get_pressure(self, lat, lon, lead_time):
+        return float(self.data["sp"].sel(latitude=lat, longitude=lon, step=lead_time))
+#+end_src
+
+*Concepts required*: =typing.Protocol= (stdlib), =@runtime_checkable=
+(stdlib), =@dmt.adapter(implements=...)=. No metaclasses. No custom
+=Interface= class. Just Python's own protocol system.
+
+** The Gradient
+
+| Level | Interface Style      | Concepts | Target User                   |
+|-------+----------------------+----------+-------------------------------|
+|     0 | =dmt.evaluate()=     |        0 | "Just show me if it works"    |
+|     1 | =@dmt.eval= + pytest |        3 | Developer running evals in CI |
+|     2 | =dmt.compare()=      |        2 | Comparing model versions      |
+|     3 | =@dmt.adapter=       |        1 | Non-LLM model providers       |
+|     4 | =@dmt.measurement=   |        1 | Scientific parameter sweeps   |
+|     5 | =dmt.LabReport=      |        5 | Full validation reports        |
+|     6 | =Protocol= + adapter |        3 | Framework/team interface design |
+
+A user can enter at Level 0 and never go deeper. Or they can graduate to
+Level 6 when they need formal contracts between teams. The system rewards
+going deeper (you get better reports, more rigorous validation, formal
+interfaces) but never requires it.
+
+This is the minimal-to-maximal gradient that every successful framework
+provides.
+
+** Contrast with Competitors
+
+| Feature                    | dmt      | deepeval | inspect | lm-eval | pytest |
+|----------------------------+----------+----------+---------+---------+--------|
+| Zero-concept hello world   | Yes (L0) | No (3)   | No (3)  | Yes     | Yes    |
+| Pytest integration         | Yes (L1) | Yes      | No      | No      | ---    |
+| Multi-model comparison     | Yes (L2) | Manual   | Manual  | Loop    | N/A    |
+| Non-LLM adapters           | Yes (L3) | No       | No      | No      | N/A    |
+| Parameterized measurement  | Yes (L4) | No       | No      | No      | Params |
+| Structured LabReport       | Yes (L5) | No       | No      | No      | No     |
+| Formal Protocol interfaces | Yes (L6) | No       | No      | Partial | N/A    |
+| Report generation          | L0+      | Cloud    | Viewer  | JSON    | No     |
+
+The key insight: *DMT matches competitors at every level while providing
+capabilities (L3--L6) that no competitor has.* The report generation at L0+
+is the immediate differentiator --- even the simplest usage produces a
+structured document, not just console output.
+
+** CLI Design
+
+Following lm-eval-harness's CLI-first pattern:
+
+#+begin_src bash
+# Simplest: evaluate a model
+dmt eval --model openai/gpt-4o --dataset evals/qa.csv --metrics accuracy
+
+# Compare models
+dmt compare --models openai/gpt-4o,anthropic/claude-3.5 --dataset evals/qa.csv
+
+# Generate report from saved results
+dmt report ./results/ --format html --template eu-ai-act
+
+# Run as pytest
+pytest --dmt-report ./report/ test_evals.py
+
+# List available metrics
+dmt metrics
+
+# List available report templates
+dmt templates
+#+end_src
+
+** Template / Report Format System
+
+Templates are the bridge between raw eval results and regulatory documents:
+
+#+begin_src bash
+dmt report ./results/ --template eu-ai-act     # EU AI Act GPAI compliance doc
+dmt report ./results/ --template iso-42001      # ISO 42001 audit artifact
+dmt report ./results/ --template sr-11-7        # Fed model risk management
+dmt report ./results/ --template oecd-qsar      # OECD QSAR validation
+dmt report ./results/ --template wp-mip         # WMO weather model intercomparison
+dmt report ./results/ --template lab-report     # Scientific paper structure
+dmt report ./results/ --template model-card     # HuggingFace model card
+#+end_src
+
+Each template is a Jinja2 file that takes structured eval results and renders
+them into a domain-specific document format. This is the killer feature: *same
+eval results, different regulatory documents.*
+
+* Appendix A: Detailed Framework Comparison
+
+(See tables in Part II)
+
+* Appendix B: Regulatory Timeline
+
+| Date           | Event                                              |
+|----------------+----------------------------------------------------|
+| 2011           | SR 11-7 Model Risk Management (Fed)                |
+| 2023           | ISO/IEC 42001 published                            |
+| Jul 2025       | EU AI Act Code of Practice published                |
+| Jul 2025       | NIST TEVV Zero Draft released                       |
+| Aug 2025       | EU AI Act GPAI obligations take effect              |
+| Jan 2025       | Basel IV takes effect (EU)                          |
+| Jan 2026       | FRTB takes effect (EU)                              |
+| Feb 2026       | International Network AI Measurement consensus      |
+| Aug 2026       | EU AI Act Commission enforcement begins             |
+| Aug 2027       | Existing GPAI models must comply with EU AI Act     |
+
+* Appendix C: Key References
+
+** AI Evaluation
+- EleutherAI lm-evaluation-harness: https://github.com/EleutherAI/lm-evaluation-harness
+- UK AISI Inspect: https://inspect.aisi.org.uk/evals/
+- RAGAS: https://docs.ragas.io/
+- DeepEval: https://deepeval.com/docs
+- promptfoo: https://www.promptfoo.dev/docs/
+- OpenAI Evals: https://github.com/openai/evals
+- LangSmith: https://docs.langchain.com/langsmith/evaluation
+- W&B Weave: https://docs.wandb.ai/weave
+- MLflow GenAI: https://mlflow.org/docs/latest/genai/eval-monitor/
+
+** Weather/Climate
+- METplus: https://dtcenter.org/community-code/metplus
+- scores (BoM/NCI): https://github.com/nci/scores
+- xskillscore: https://github.com/xarray-contrib/xskillscore
+- climpred: https://github.com/pangeo-data/climpred
+- WP-MIP: https://www.wcrp-esmo.org/activities/wp-mip
+
+** Finance
+- SR 11-7: https://www.federalreserve.gov/supervisionreg/srletters/sr1107.htm
+- ValidMind: https://validmind.com/
+- ModelOp: https://www.modelop.com
+
+** Drug Discovery
+- ProQSAR: https://chemrxiv.org/doi/full/10.26434/chemrxiv-2025-l6j8v
+- TDC: https://tdcommons.ai/
+- PharmaBench: https://www.nature.com/articles/s41597-024-03793-0
+
+** Regulatory
+- EU AI Act GPAI Guidelines: https://artificialintelligenceact.eu/gpai-guidelines-overview/
+- EU AI Act Code of Practice: https://code-of-practice.ai/
+- NIST AI Standards: https://www.nist.gov/artificial-intelligence/ai-standards
+- ISO/IEC 42001: https://www.iso.org/standard/42001

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Emacs
+*~
+\#*\#
+.dir-locals.el
+
+# Agent artifacts
+.agent-shell/
+.claude/
+.cache/
+
+# OS
+.DS_Store
