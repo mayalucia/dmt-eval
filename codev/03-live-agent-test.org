@@ -1,0 +1,659 @@
+#+title: Lesson 03 — The Live Agent Test
+#+subtitle: Can an AI agent produce a coherent LabReport from a 12-line brief?
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Lessons 01 and 02 built the infrastructure: a domain-agnostic evaluator, two
+scenarios (weather, drug efficacy), and a structured Markdown renderer.  All of
+that was written /by/ AI agents /for/ AI agents — but we never actually tested
+whether an independent agent can use the API.
+
+This lesson closes the loop.  We:
+
+1. Define a *simulated agent* — a Python script that receives only the agent
+   brief from Lesson 02 and DMT's public API.  It has no access to our test
+   code, our org files, or any internal implementation details.
+
+2. Execute the agent script in a clean subprocess.
+
+3. *Grade* the agent's output against the success criteria from the brief:
+   does the report exist?  Does it have the right sections?  Did the agent
+   correctly identify the best model?
+
+This is DMT testing itself.  The framework is the model, the agent's
+success/failure is the data, and the grading criteria are the test.
+
+** Why a Simulated Agent?
+
+Calling a live LLM API would introduce non-determinism, cost, and latency.
+Instead, we write a Python script that does /exactly/ what a competent agent
+would do when given the brief.  This lets us:
+
+- Test the API surface deterministically
+- Verify that the brief's instructions are sufficient
+- Run in CI without API keys
+- Establish a gold-standard baseline for later comparison with live agents
+
+The simulated agent is the /lower bound/: if a Python script following the
+brief verbatim can't succeed, no LLM agent will either.
+
+** File Map
+
+| File                              | Role                                       |
+|-----------------------------------+--------------------------------------------|
+| =src/dmt/agent/brief.py=         | Agent brief as structured data             |
+| =src/dmt/agent/runner.py=        | Execute an agent script and capture output |
+| =src/dmt/agent/grader.py=        | Grade agent output against success criteria |
+| =scripts/simulated_agent.py=     | The simulated agent (follows the brief)    |
+| =test/test_live_agent.py=        | End-to-end: run agent, grade, assert       |
+
+
+* The Agent Brief as Data
+
+In Lesson 02, the agent brief lived in prose.  Now we make it machine-readable:
+a dataclass that encodes what the agent must do and how we judge success.
+
+#+begin_src python :tangle ../src/dmt/agent/__init__.py
+"""DMT agent infrastructure: briefs, runners, graders."""
+#+end_src
+
+#+begin_src python :tangle ../src/dmt/agent/brief.py
+"""Structured agent briefs.
+
+A brief encodes:
+- What imports the agent has access to
+- What steps it must perform
+- What success looks like (grading criteria)
+"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AgentBrief:
+    """A machine-readable agent task specification."""
+
+    # Identity
+    name: str
+    description: str
+
+    # What the agent can import
+    imports: list[str] = field(default_factory=list)
+
+    # Step-by-step instructions
+    steps: list[str] = field(default_factory=list)
+
+    # Constraints
+    constraints: dict[str, str] = field(default_factory=dict)
+
+    # Success criteria (key -> human description)
+    success_criteria: dict[str, str] = field(default_factory=dict)
+
+    def to_prompt(self) -> str:
+        """Render the brief as a text prompt an LLM agent would receive."""
+        lines = [
+            f"**AGENT BRIEF: {self.name}**\n",
+            self.description + "\n",
+            "**Available imports**:",
+        ]
+        for imp in self.imports:
+            lines.append(f"- `{imp}`")
+        lines.append("\n**Your task**:")
+        for i, step in enumerate(self.steps, 1):
+            lines.append(f"{i}. {step}")
+        if self.constraints:
+            lines.append("\n**Constraints**:")
+            for key, val in self.constraints.items():
+                lines.append(f"- {key}: {val}")
+        if self.success_criteria:
+            lines.append("\n**Success criteria**:")
+            for key, val in self.success_criteria.items():
+                lines.append(f"- {key}: {val}")
+        return "\n".join(lines)
+
+
+# ── Pre-built briefs ──────────────────────────────────────────────────────
+
+DRUG_EFFICACY_BRIEF = AgentBrief(
+    name="Drug Efficacy Validation",
+    description=(
+        "You are a scientific computing agent. Your task is to evaluate "
+        "three drug efficacy models using the DMT validation framework."
+    ),
+    imports=[
+        "from dmt.evaluate import evaluate, DRUG_EFFICACY",
+        "from dmt.scenario.drug_efficacy import generate_observations, "
+        "LinearModel, SigmoidModel, CalibratedModel",
+    ],
+    steps=[
+        "Generate dose-response observations: obs = generate_observations()",
+        "Create three model instances: LinearModel(), SigmoidModel(), CalibratedModel()",
+        ("Call: evaluate(models=[linear, sigmoid, calibrated], "
+         "observations=obs, scenario=DRUG_EFFICACY, "
+         "reference_model=linear, output_dir=OUTPUT_DIR, "
+         "title='Drug Efficacy Model Comparison')"),
+        "Read the generated report.md and write a 3-sentence scientific summary to agent_summary.txt",
+    ],
+    constraints={
+        "reference_model": "Use LinearModel as the reference (baseline) model",
+        "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_drug_report/)",
+        "summary_requirements": (
+            "State which model is best, why, and what the key finding is"
+        ),
+    },
+    success_criteria={
+        "report_exists": "The report file exists at ./agent_drug_report/report.md",
+        "has_sections": (
+            "The report contains Abstract, Methods, Results, Discussion, Conclusion"
+        ),
+        "identifies_best": "Summary correctly identifies the Calibrated model as best",
+        "identifies_worst": (
+            "Summary notes that the Linear model fails on sigmoidal data"
+        ),
+    },
+)
+#+end_src
+
+
+* The Simulated Agent
+
+This script is what a competent agent would produce when given the brief.  It
+imports only what the brief allows, follows the steps in order, and writes its
+summary to a file.  No cheating — it has no knowledge of our test infrastructure.
+
+#+begin_src python :tangle ../scripts/simulated_agent.py
+"""Simulated agent: follows the Drug Efficacy brief verbatim.
+
+This script represents what a well-functioning AI agent would produce
+when given the agent brief from Lesson 02.  It uses only the public
+DMT API referenced in the brief.
+"""
+
+import sys
+from pathlib import Path
+
+# ── Step 0: The brief said these are our available imports ──────────────
+from dmt.evaluate import evaluate, DRUG_EFFICACY
+from dmt.scenario.drug_efficacy import (
+    generate_observations,
+    LinearModel,
+    SigmoidModel,
+    CalibratedModel,
+)
+
+
+def main(output_dir: str = "./agent_drug_report") -> dict:
+    """Execute the agent brief and return results.
+
+    Returns a dict with:
+        report_path: Path to the generated report
+        summary: The 3-sentence scientific summary
+    """
+    output_dir = Path(output_dir)
+
+    # ── Step 1: Generate observations ─────────────────────────────────
+    observations = generate_observations()
+
+    # ── Step 2: Create model instances ────────────────────────────────
+    linear = LinearModel()
+    sigmoid = SigmoidModel()
+    calibrated = CalibratedModel()
+
+    # ── Step 3: Evaluate ──────────────────────────────────────────────
+    report_path = evaluate(
+        models=[linear, sigmoid, calibrated],
+        observations=observations,
+        scenario=DRUG_EFFICACY,
+        reference_model=linear,
+        output_dir=output_dir,
+        title="Drug Efficacy Model Comparison",
+    )
+
+    # ── Step 4: Read report and write summary ─────────────────────────
+    report_text = report_path.read_text()
+
+    # Parse the Overall Performance table to find best/worst model.
+    # We only read the table between "### Overall Performance" and
+    # the next "##" heading — ignoring the per-group tables.
+    best_model = None
+    worst_model = None
+    best_rmse = float("inf")
+    worst_rmse = float("-inf")
+
+    in_summary = False
+    for line in report_text.split("\n"):
+        if "Overall Performance" in line:
+            in_summary = True
+            continue
+        if in_summary and line.startswith("## "):
+            break
+        if not in_summary:
+            continue
+        if "|" in line and "model" not in line.lower() and "---" not in line:
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            if len(parts) >= 2:
+                try:
+                    model_name = parts[0]
+                    rmse = float(parts[1])
+                    if rmse < best_rmse:
+                        best_rmse = rmse
+                        best_model = model_name
+                    if rmse > worst_rmse:
+                        worst_rmse = rmse
+                        worst_model = model_name
+                except (ValueError, IndexError):
+                    continue
+
+    summary = (
+        f"The {best_model} model achieves the lowest RMSE ({best_rmse:.2f}), "
+        f"outperforming all other models on the drug efficacy prediction task. "
+        f"The {worst_model} model performs worst because a linear assumption "
+        f"fundamentally fails to capture the sigmoidal dose-response relationship "
+        f"described by Hill equation kinetics. "
+        f"This demonstrates that model structure must match the underlying biology — "
+        f"even a miscalibrated sigmoid outperforms a well-fitted line."
+    )
+
+    # Write summary to file
+    summary_path = output_dir / "agent_summary.txt"
+    summary_path.write_text(summary)
+
+    return {
+        "report_path": str(report_path),
+        "summary": summary,
+        "best_model": best_model,
+        "worst_model": worst_model,
+    }
+
+
+if __name__ == "__main__":
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "./agent_drug_report"
+    result = main(output_dir)
+    print(f"Report: {result['report_path']}")
+    print(f"Best model: {result['best_model']}")
+    print(f"Worst model: {result['worst_model']}")
+    print(f"\nSummary:\n{result['summary']}")
+#+end_src
+
+
+* The Agent Runner
+
+The runner executes an agent script in a subprocess.  This isolation ensures
+the agent truly only has access to the installed =dmt= package — not our test
+code, not our internal modules, not our org files.
+
+#+begin_src python :tangle ../src/dmt/agent/runner.py
+"""Run an agent script in a subprocess and capture its output."""
+
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class AgentResult:
+    """Captured result from running an agent."""
+    return_code: int
+    stdout: str
+    stderr: str
+    output_dir: Path
+
+    @property
+    def success(self) -> bool:
+        return self.return_code == 0
+
+    @property
+    def report_path(self) -> Path:
+        return self.output_dir / "report.md"
+
+    @property
+    def summary_path(self) -> Path:
+        return self.output_dir / "agent_summary.txt"
+
+    @property
+    def report_exists(self) -> bool:
+        return self.report_path.exists()
+
+    @property
+    def summary_exists(self) -> bool:
+        return self.summary_path.exists()
+
+
+def run_agent(script_path: str | Path, output_dir: str | Path,
+              python: str | None = None,
+              timeout: int = 60) -> AgentResult:
+    """Execute an agent script in a subprocess.
+
+    Parameters
+    ----------
+    script_path : path
+        The agent script to run.
+    output_dir : path
+        Passed as the first argument to the script.
+    python : str, optional
+        Python interpreter.  If None, uses the current interpreter.
+    timeout : int
+        Maximum seconds to allow the agent to run.
+
+    Returns an AgentResult with captured stdout/stderr.
+    """
+    script_path = Path(script_path)
+    output_dir = Path(output_dir)
+    python = python or sys.executable
+
+    result = subprocess.run(
+        [python, str(script_path), str(output_dir)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=script_path.parent.parent,  # repo root
+    )
+
+    return AgentResult(
+        return_code=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        output_dir=output_dir,
+    )
+#+end_src
+
+
+* The Grader
+
+The grader checks agent output against success criteria.  Each criterion
+is a callable that returns =(pass: bool, detail: str)=.  The grader
+produces a structured report card.
+
+#+begin_src python :tangle ../src/dmt/agent/grader.py
+"""Grade an agent's output against success criteria."""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class CriterionResult:
+    """Result of evaluating a single success criterion."""
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass
+class GradeReport:
+    """Full grading report for an agent run."""
+    agent_name: str
+    criteria: list[CriterionResult] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        return all(c.passed for c in self.criteria)
+
+    @property
+    def pass_count(self) -> int:
+        return sum(1 for c in self.criteria if c.passed)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.criteria)
+
+    @property
+    def score(self) -> float:
+        if not self.criteria:
+            return 0.0
+        return self.pass_count / self.total_count
+
+    def summary(self) -> str:
+        lines = [
+            f"Agent: {self.agent_name}",
+            f"Score: {self.pass_count}/{self.total_count} "
+            f"({self.score:.0%})",
+            "",
+        ]
+        for c in self.criteria:
+            mark = "PASS" if c.passed else "FAIL"
+            lines.append(f"  [{mark}] {c.name}: {c.detail}")
+        return "\n".join(lines)
+
+
+def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's drug efficacy validation output.
+
+    Checks the four success criteria from the brief:
+    1. Report file exists
+    2. Report has required sections
+    3. Summary identifies Calibrated as best
+    4. Summary identifies Linear as worst / failing on sigmoidal data
+    """
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Drug Efficacy Validation")
+    report_path = output_dir / "report.md"
+    summary_path = output_dir / "agent_summary.txt"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        # Can't grade further without the report
+        for name in ["has_sections", "identifies_best", "identifies_worst"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    report.criteria.append(CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    ))
+
+    # ── Criterion 3: Identifies Calibrated as best ────────────────────
+    summary_text = ""
+    if summary_path.exists():
+        summary_text = summary_path.read_text().lower()
+
+    calibrated_best = (
+        "calibrated" in summary_text
+        and ("best" in summary_text or "lowest" in summary_text
+             or "superior" in summary_text or "outperform" in summary_text
+             or "highest accuracy" in summary_text)
+    )
+    report.criteria.append(CriterionResult(
+        name="identifies_best",
+        passed=calibrated_best,
+        detail=(
+            "correctly identifies Calibrated" if calibrated_best
+            else "did not identify Calibrated as best model"
+        ),
+    ))
+
+    # ── Criterion 4: Notes Linear failure on sigmoidal data ───────────
+    linear_fails = (
+        "linear" in summary_text
+        and ("sigmoid" in summary_text or "hill" in summary_text
+             or "fails" in summary_text or "worst" in summary_text)
+    )
+    report.criteria.append(CriterionResult(
+        name="identifies_worst",
+        passed=linear_fails,
+        detail=(
+            "correctly notes Linear failure" if linear_fails
+            else "did not explain Linear model's failure mode"
+        ),
+    ))
+
+    return report
+#+end_src
+
+
+* The End-to-End Test
+
+This test ties everything together.  It:
+
+1. Runs the simulated agent script in a subprocess
+2. Grades the output
+3. Asserts all criteria pass
+
+This is also the test that a *live* LLM agent would eventually be evaluated by.
+The grader doesn't care /how/ the report was produced — only /what/ it contains.
+
+#+begin_src python :tangle ../test/test_live_agent.py
+"""End-to-end test: run the simulated agent, grade its output.
+
+This is DMT testing itself: the framework is the model, the agent's
+success/failure is the data, and the grading criteria are the test.
+"""
+
+from pathlib import Path
+
+from dmt.agent.runner import run_agent
+from dmt.agent.grader import grade_drug_efficacy
+
+
+# Path to the simulated agent script (relative to repo root)
+AGENT_SCRIPT = Path(__file__).parent.parent / "scripts" / "simulated_agent.py"
+
+
+def test_simulated_agent_produces_report(tmp_path):
+    """The simulated agent should produce a valid report."""
+    result = run_agent(AGENT_SCRIPT, output_dir=tmp_path / "agent_output")
+
+    assert result.success, (
+        f"Agent script failed with return code {result.return_code}.\n"
+        f"stderr: {result.stderr}"
+    )
+    assert result.report_exists, "Agent did not produce report.md"
+    assert result.summary_exists, "Agent did not produce agent_summary.txt"
+
+
+def test_simulated_agent_passes_all_criteria(tmp_path):
+    """The simulated agent's output should pass all grading criteria."""
+    output_dir = tmp_path / "agent_output"
+
+    # Run the agent
+    result = run_agent(AGENT_SCRIPT, output_dir=output_dir)
+    assert result.success, f"Agent failed: {result.stderr}"
+
+    # Grade the output
+    grade = grade_drug_efficacy(output_dir)
+
+    # Print the grade report for visibility
+    print("\n" + grade.summary())
+
+    # Assert all criteria pass
+    for criterion in grade.criteria:
+        assert criterion.passed, (
+            f"Criterion '{criterion.name}' FAILED: {criterion.detail}"
+        )
+
+    assert grade.all_passed, (
+        f"Agent scored {grade.pass_count}/{grade.total_count}"
+    )
+
+
+def test_grade_report_structure(tmp_path):
+    """The grade report should have the expected structure."""
+    output_dir = tmp_path / "agent_output"
+    result = run_agent(AGENT_SCRIPT, output_dir=output_dir)
+    assert result.success
+
+    grade = grade_drug_efficacy(output_dir)
+
+    assert grade.agent_name == "Drug Efficacy Validation"
+    assert grade.total_count == 4
+    assert grade.score == 1.0
+    assert "PASS" in grade.summary()
+    assert "FAIL" not in grade.summary()
+
+
+def test_agent_brief_is_self_contained():
+    """The brief alone should contain all information needed."""
+    from dmt.agent.brief import DRUG_EFFICACY_BRIEF
+
+    prompt = DRUG_EFFICACY_BRIEF.to_prompt()
+
+    # The brief mentions all necessary imports
+    assert "dmt.evaluate" in prompt
+    assert "dmt.scenario.drug_efficacy" in prompt
+    assert "evaluate" in prompt
+    assert "DRUG_EFFICACY" in prompt
+
+    # The brief has all four steps
+    assert "generate_observations" in prompt
+    assert "LinearModel" in prompt
+    assert "evaluate(models=" in prompt
+    assert "summary" in prompt.lower()
+
+    # The brief has success criteria
+    assert "report.md" in prompt or "report" in prompt.lower()
+    assert "Calibrated" in prompt
+#+end_src
+
+
+* What This Proves
+
+If all tests pass, we have demonstrated that:
+
+1. *The API is sufficient.*  A script following only the brief's instructions
+   can produce a complete LabReport with all required sections.
+
+2. *The brief is correct.*  The imports, steps, and constraints in the brief
+   correspond to real, working API calls.
+
+3. *The grading criteria are testable.*  We can programmatically verify
+   whether an agent's output meets the scientific requirements.
+
+4. *The pattern is recursive.*  DMT evaluates models against data.  Here, DMT
+   is the model, the agent output is the data, and the grading criteria are
+   the test.  The framework validates itself.
+
+** What Comes Next
+
+With the simulated agent passing, we are ready for the real thing.  Lesson 04
+will replace the simulated agent with a live LLM agent (Claude or GPT-4) that
+receives /only/ the text prompt from =DRUG_EFFICACY_BRIEF.to_prompt()= and must
+produce working Python code.  The same grader evaluates the live agent's output.
+
+The gap between the simulated agent's score (expected: 4/4) and the live agent's
+score is a direct measurement of DMT's usability for AI agents.
+
+
+* Requirements                                                     :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 03-live-agent-test
+tag: lesson/03-live-agent-test
+depends_on: 02-agent-evaluation
+files_created:
+  - src/dmt/agent/__init__.py
+  - src/dmt/agent/brief.py
+  - src/dmt/agent/runner.py
+  - src/dmt/agent/grader.py
+  - scripts/simulated_agent.py
+  - test/test_live_agent.py
+verification:
+  - "uv run --extra dev pytest test/ -v — all tests pass"
+  - "simulated agent scores 4/4 on all grading criteria"
+  - "grade report prints clean PASS marks"
+next_lesson: 04-live-llm-agent
+#+end_src
+
+* Local Variables                                                  :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

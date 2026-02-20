@@ -42,6 +42,7 @@ packages = ["src/dmt"]
 [tool.pytest.ini_options]
 testpaths = ["test"]
 pythonpath = ["src"]
+markers = ["llm: tests that call live LLM APIs (require API key)"]
 
 [tool.ruff]
 src = ["src"]

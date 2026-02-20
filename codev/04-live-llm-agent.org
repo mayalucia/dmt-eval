@@ -1,0 +1,504 @@
+#+title: Lesson 04 — The Live LLM Agent
+#+subtitle: Claude receives a brief, writes code, gets graded
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Lesson 03 proved that a /simulated/ agent — a hand-written script following
+the brief — can score 4/4 on DMT's grading criteria.  That established the
+lower bound: the API is sufficient, the brief is complete, the grader works.
+
+Now we replace the simulation with reality.  A live LLM (Claude) receives
+/only/ the text prompt from =DRUG_EFFICACY_BRIEF.to_prompt()= and must:
+
+1. Produce a complete Python script that uses DMT's public API
+2. Generate a LabReport with all required sections
+3. Write a scientific summary identifying the best and worst models
+
+The same =grade_drug_efficacy()= grader from Lesson 03 evaluates the output.
+The gap between the simulated agent's score (4/4) and the live agent's score
+measures DMT's /real/ usability for autonomous AI agents.
+
+** The Architecture
+
+#+begin_example
+                          ┌──────────────┐
+  AgentBrief.to_prompt()  │              │  Python code
+  ───────────────────────>│   Claude API  │──────────────┐
+                          │              │              │
+                          └──────────────┘              v
+                                                ┌──────────────┐
+                                                │  tempfile.py  │
+                                                └──────┬───────┘
+                                                       │
+                                                       v  subprocess
+                                                ┌──────────────┐
+                                                │  Agent output │
+                                                │  report.md    │
+                                                │  summary.txt  │
+                                                └──────┬───────┘
+                                                       │
+                                                       v
+                                                ┌──────────────┐
+                                                │   Grader      │
+                                                │   4 criteria  │
+                                                └──────────────┘
+#+end_example
+
+The key principle: *the LLM never sees the grader*.  It receives only the
+brief.  This is a genuine test of the API's discoverability, not a test of
+the LLM's ability to game a rubric.
+
+** File Map
+
+| File                                | Role                                       |
+|-------------------------------------+--------------------------------------------|
+| =src/dmt/agent/llm_runner.py=      | Send brief to Claude, extract code, run it |
+| =scripts/run_live_agent.py=        | CLI: run live agent and print grade report  |
+| =test/test_llm_agent.py=           | Pytest tests (requires API key + =--llm=)  |
+
+
+* The LLM Runner
+
+This module sends the agent brief to Claude and extracts a Python script
+from the response.  The script is written to a temporary file and executed
+in a subprocess — identical to how we run the simulated agent.
+
+The prompt engineering is minimal and deliberate: we add only a system message
+that says "respond with a Python script", plus the brief itself.  No hints
+about the grading criteria, no examples of correct output.
+
+#+begin_src python :tangle ../src/dmt/agent/llm_runner.py
+"""Send an agent brief to an LLM and execute the generated code.
+
+Currently supports Anthropic Claude.  The runner:
+1. Sends the brief as a user message
+2. Extracts a Python script from the response
+3. Writes it to a temp file and runs it in a subprocess
+4. Returns the AgentResult for grading
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dmt.agent.brief import AgentBrief
+from dmt.agent.runner import AgentResult
+
+
+@dataclass
+class LLMResponse:
+    """Raw response from the LLM."""
+    model: str
+    raw_text: str
+    extracted_code: str
+    usage: dict = field(default_factory=dict)
+
+
+def _extract_python_code(text: str) -> str:
+    """Extract Python code from a markdown-fenced response.
+
+    Looks for ```python ... ``` blocks.  If multiple blocks exist,
+    concatenates them (the agent may split imports from main logic).
+    If no fenced blocks, assumes the entire response is code.
+    """
+    blocks = re.findall(r"```python\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return "\n\n".join(blocks)
+    # Fallback: try generic code fence
+    blocks = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if blocks:
+        return "\n\n".join(blocks)
+    # Last resort: the whole thing
+    return text
+
+
+def call_claude(
+    brief: AgentBrief,
+    output_dir: str | Path,
+    model: str = "claude-sonnet-4-20250514",
+    max_tokens: int = 4096,
+) -> LLMResponse:
+    """Send the brief to Claude and get back a response.
+
+    Requires ANTHROPIC_API_KEY in the environment.
+
+    Raises
+    ------
+    RuntimeError
+        If ANTHROPIC_API_KEY is not set or empty.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set or empty.\n"
+            "Set it with: export ANTHROPIC_API_KEY='sk-ant-...'"
+        )
+
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    output_dir = Path(output_dir)
+    system_prompt = (
+        "You are a scientific computing agent. "
+        "Respond with a single, complete Python script that accomplishes "
+        "the task described in the brief. The script must:\n"
+        "- Be self-contained (all imports at the top)\n"
+        "- Write outputs to the directory specified in the constraints\n"
+        "- Write a file called 'agent_summary.txt' to the output directory "
+        "containing a 3-sentence scientific summary\n"
+        "- Use only the imports listed in the brief\n"
+        "- Be executable with: python script.py <output_dir>\n\n"
+        "Wrap your code in a ```python code fence."
+    )
+
+    user_message = (
+        brief.to_prompt()
+        + f"\n\nThe output directory is: {output_dir}\n"
+        "Respond with only the Python script."
+    )
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    raw_text = response.content[0].text
+    code = _extract_python_code(raw_text)
+
+    return LLMResponse(
+        model=model,
+        raw_text=raw_text,
+        extracted_code=code,
+        usage={
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        },
+    )
+
+
+def run_llm_agent(
+    brief: AgentBrief,
+    output_dir: str | Path,
+    model: str = "claude-sonnet-4-20250514",
+    repo_root: str | Path | None = None,
+    max_tokens: int = 4096,
+    timeout: int = 60,
+) -> tuple[LLMResponse, AgentResult]:
+    """Full pipeline: brief -> Claude -> code -> execute -> result.
+
+    Parameters
+    ----------
+    brief : AgentBrief
+        The task specification.
+    output_dir : path
+        Where the agent should write its outputs.
+    model : str
+        Claude model to use.
+    repo_root : path, optional
+        Working directory for execution (must have dmt importable).
+        If None, uses the dmt-eval repo root.
+    max_tokens : int
+        Max tokens for Claude response.
+    timeout : int
+        Max seconds for the generated script to run.
+
+    Returns (LLMResponse, AgentResult).
+    """
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get the LLM's code
+    llm_response = call_claude(brief, output_dir, model, max_tokens)
+
+    # Write the code to a temp file
+    script_dir = output_dir / "_agent_workspace"
+    script_dir.mkdir(exist_ok=True)
+    script_path = script_dir / "agent_script.py"
+    script_path.write_text(llm_response.extracted_code)
+
+    # Also save the raw response for debugging
+    (script_dir / "llm_raw_response.txt").write_text(llm_response.raw_text)
+
+    # Determine repo root for PYTHONPATH
+    if repo_root is None:
+        # Walk up from this file to find pyproject.toml
+        candidate = Path(__file__).resolve().parent
+        while candidate != candidate.parent:
+            if (candidate / "pyproject.toml").exists():
+                repo_root = candidate
+                break
+            candidate = candidate.parent
+        else:
+            repo_root = Path.cwd()
+    repo_root = Path(repo_root)
+
+    # Execute the script
+    env = os.environ.copy()
+    src_path = str(repo_root / "src")
+    if "PYTHONPATH" in env:
+        env["PYTHONPATH"] = src_path + os.pathsep + env["PYTHONPATH"]
+    else:
+        env["PYTHONPATH"] = src_path
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), str(output_dir)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=str(repo_root),
+        env=env,
+    )
+
+    agent_result = AgentResult(
+        return_code=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        output_dir=output_dir,
+    )
+
+    return llm_response, agent_result
+#+end_src
+
+
+* The CLI Script
+
+A simple command-line script that runs the live agent test and prints
+the grade report.  This is what a human runs to see DMT tested by an
+AI agent in real time.
+
+#+begin_src python :tangle ../scripts/run_live_agent.py
+"""Run a live LLM agent on the drug efficacy brief and print the grade.
+
+Usage:
+    uv run --extra llm --extra dev python scripts/run_live_agent.py [output_dir]
+"""
+
+import sys
+from pathlib import Path
+
+from dmt.agent.brief import DRUG_EFFICACY_BRIEF
+from dmt.agent.llm_runner import run_llm_agent
+from dmt.agent.grader import grade_drug_efficacy
+
+
+def main():
+    output_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./llm_agent_output")
+
+    print(f"Sending brief to Claude...")
+    print(f"Output directory: {output_dir}\n")
+
+    try:
+        llm_response, agent_result = run_llm_agent(
+            brief=DRUG_EFFICACY_BRIEF,
+            output_dir=output_dir,
+        )
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        return 1
+
+    print(f"Model: {llm_response.model}")
+    print(f"Tokens: {llm_response.usage}")
+    print(f"Agent exit code: {agent_result.return_code}")
+
+    if agent_result.stderr:
+        print(f"\nAgent stderr:\n{agent_result.stderr}")
+
+    if agent_result.stdout:
+        print(f"\nAgent stdout:\n{agent_result.stdout}")
+
+    # Save the generated code for inspection
+    workspace = output_dir / "_agent_workspace"
+    print(f"\nGenerated script saved to: {workspace / 'agent_script.py'}")
+    print(f"Raw LLM response saved to: {workspace / 'llm_raw_response.txt'}")
+
+    # Grade
+    print("\n" + "=" * 60)
+    grade = grade_drug_efficacy(output_dir)
+    print(grade.summary())
+    print("=" * 60)
+
+    # Show the agent's summary if it exists
+    summary_path = output_dir / "agent_summary.txt"
+    if summary_path.exists():
+        print(f"\nAgent's scientific summary:\n{summary_path.read_text()}")
+
+    return 0 if grade.all_passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+#+end_src
+
+
+* The Pytest Tests
+
+These tests are marked with =@pytest.mark.llm= so they only run when
+explicitly requested with =pytest -m llm=.  This prevents accidental
+API calls during normal development.
+
+#+begin_src python :tangle ../test/test_llm_agent.py
+"""Live LLM agent tests.
+
+These tests call the Anthropic API and cost real money.
+Run with: uv run --extra llm --extra dev pytest test/test_llm_agent.py -v -m llm
+
+Skip these in CI unless ANTHROPIC_API_KEY is set and --llm is passed.
+"""
+
+import os
+from pathlib import Path
+
+import pytest
+
+# Skip entire module if no API key
+pytestmark = [
+    pytest.mark.llm,
+    pytest.mark.skipif(
+        not os.environ.get("ANTHROPIC_API_KEY"),
+        reason="ANTHROPIC_API_KEY not set",
+    ),
+]
+
+
+@pytest.fixture
+def agent_output(tmp_path):
+    """Run the live agent once and return (llm_response, agent_result, output_dir)."""
+    from dmt.agent.brief import DRUG_EFFICACY_BRIEF
+    from dmt.agent.llm_runner import run_llm_agent
+
+    output_dir = tmp_path / "llm_agent"
+    llm_response, agent_result = run_llm_agent(
+        brief=DRUG_EFFICACY_BRIEF,
+        output_dir=output_dir,
+    )
+    return llm_response, agent_result, output_dir
+
+
+def test_llm_produces_valid_code(agent_output):
+    """Claude should produce syntactically valid Python."""
+    llm_response, _, _ = agent_output
+    code = llm_response.extracted_code
+
+    # Should be valid Python
+    compile(code, "<agent>", "exec")
+
+
+def test_llm_agent_executes_successfully(agent_output):
+    """The generated script should run without errors."""
+    _, agent_result, _ = agent_output
+
+    assert agent_result.success, (
+        f"Agent script failed (exit code {agent_result.return_code}).\n"
+        f"stderr: {agent_result.stderr}\n"
+        f"stdout: {agent_result.stdout}"
+    )
+
+
+def test_llm_agent_produces_report(agent_output):
+    """The agent should produce both report.md and agent_summary.txt."""
+    _, agent_result, _ = agent_output
+
+    if not agent_result.success:
+        pytest.skip(f"Agent failed: {agent_result.stderr[:200]}")
+
+    assert agent_result.report_exists, "No report.md produced"
+    assert agent_result.summary_exists, "No agent_summary.txt produced"
+
+
+def test_llm_agent_passes_grading(agent_output):
+    """The live agent should pass all grading criteria."""
+    _, agent_result, output_dir = agent_output
+
+    if not agent_result.success:
+        pytest.skip(f"Agent failed: {agent_result.stderr[:200]}")
+
+    from dmt.agent.grader import grade_drug_efficacy
+    grade = grade_drug_efficacy(output_dir)
+
+    print(f"\n{grade.summary()}")
+
+    for criterion in grade.criteria:
+        assert criterion.passed, (
+            f"Criterion '{criterion.name}' FAILED: {criterion.detail}"
+        )
+#+end_src
+
+
+* What Happens When We Run This
+
+When we execute =scripts/run_live_agent.py=, the sequence is:
+
+1. =DRUG_EFFICACY_BRIEF.to_prompt()= renders the brief to text
+2. The text is sent to Claude with a system prompt: "respond with a Python script"
+3. Claude produces a script that imports from =dmt.evaluate= and =dmt.scenario.drug_efficacy=
+4. The script is saved to =_agent_workspace/agent_script.py= and executed
+5. The grader checks the output: report exists?  Sections present?  Best model identified?
+
+The /interesting/ failure modes are:
+
+- *Code doesn't compile*: Claude misunderstood the API
+- *Code runs but no report*: wrong output path, wrong function call
+- *Report exists but summary wrong*: the agent can use the API but can't
+  interpret the results
+
+Each failure mode tells us something specific about DMT's interface quality.
+
+** Comparing Simulated vs Live
+
+| Metric              | Simulated (Lesson 03) | Live (Lesson 04) |
+|---------------------+-----------------------+-------------------|
+| Deterministic?      | Yes                   | No                |
+| Cost?               | Free                  | ~$0.01 per run    |
+| Grading criteria    | 4/4                   | TBD               |
+| Failure attribution | Impossible (hardcoded)| API friction      |
+
+The delta between 4/4 (simulated) and the live score is a direct measurement
+of how much /implicit knowledge/ the simulated agent had that wasn't in the
+brief.  If the live agent also scores 4/4, the brief is genuinely complete.
+
+
+* Configuring pytest for the =llm= marker
+
+We need to register the =llm= marker so pytest doesn't warn about it.
+
+#+begin_src python :tangle no
+# Add to pyproject.toml [tool.pytest.ini_options]:
+# markers = ["llm: tests that call live LLM APIs (require API key)"]
+#+end_src
+
+This is a configuration note — we'll add it directly to =pyproject.toml= rather
+than tangling.
+
+
+* Requirements                                                     :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 04-live-llm-agent
+tag: lesson/04-live-llm-agent
+depends_on: 03-live-agent-test
+files_created:
+  - src/dmt/agent/llm_runner.py
+  - scripts/run_live_agent.py
+  - test/test_llm_agent.py
+verification:
+  - "uv run --extra dev pytest test/ -v — existing 26 tests still pass"
+  - "uv run --extra llm --extra dev python scripts/run_live_agent.py — live agent runs"
+  - "live agent scores 4/4 on grading criteria"
+next_lesson: 05-multi-model-tournament
+#+end_src
+
+* Local Variables                                                  :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:
