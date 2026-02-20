@@ -92,3 +92,46 @@ DRUG_EFFICACY_BRIEF = AgentBrief(
         ),
     },
 )
+
+
+WEATHER_BRIEF = AgentBrief(
+    name="Weather Prediction Validation",
+    description=(
+        "You are a scientific computing agent. Your task is to evaluate "
+        "three weather prediction models using the DMT validation framework."
+    ),
+    imports=[
+        "from dmt.evaluate import evaluate, WEATHER",
+        "from dmt.scenario.weather import generate_observations, "
+        "PersistenceModel, ClimatologyModel, NoisyRegressionModel",
+    ],
+    steps=[
+        "Generate weather observations: obs = generate_observations(n_days=365, seed=42)",
+        ("Create three model instances: PersistenceModel(), "
+         "ClimatologyModel(), NoisyRegressionModel(alpha=0.7, noise_std=0.5)"),
+        ("Call: evaluate(models=[persistence, climatology, regression], "
+         "observations=obs, scenario=WEATHER, "
+         "reference_model=climatology, output_dir=OUTPUT_DIR, "
+         "title='Weather Prediction Model Comparison')"),
+        "Read the generated report.md and write a 3-sentence scientific summary to agent_summary.txt",
+    ],
+    constraints={
+        "reference_model": "Use ClimatologyModel as the reference (baseline) model",
+        "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_weather_report/)",
+        "summary_requirements": (
+            "State which model is best, why, and what the key finding is"
+        ),
+    },
+    success_criteria={
+        "report_exists": "The report file exists at the output directory",
+        "has_sections": (
+            "The report contains Abstract, Methods, Results, Discussion, Conclusion"
+        ),
+        "identifies_best": (
+            "Summary identifies NoisyRegression as the best model"
+        ),
+        "identifies_reference": (
+            "Summary mentions Climatology as the baseline or reference"
+        ),
+    },
+)

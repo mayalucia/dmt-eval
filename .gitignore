@@ -26,6 +26,7 @@ dmt_report/
 drug_report/
 agent_drug_report/
 llm_agent_output/
+tournament_output/
 
 # OS
 .DS_Store

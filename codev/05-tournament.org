@@ -1,0 +1,831 @@
+#+title: Lesson 05 — The Tournament
+#+subtitle: Multiple agents, multiple domains, structured grading
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Lesson 04 tested one agent (Claude Sonnet) on one domain (drug efficacy).
+The result was encouraging — 4/4 after brief improvements — but a single
+data point proves nothing.  We need to answer three questions:
+
+1. *Does the pattern generalize across domains?*  A weather agent brief
+   should work just like the drug efficacy brief.
+
+2. *Does it generalize across LLMs?*  Different models (Sonnet, Haiku,
+   GPT-4o) may interpret the same brief differently.
+
+3. *Is the grading robust?*  Keyword matching is fragile.  We should move
+   toward structured output so agents return JSON, not prose.
+
+This lesson builds:
+
+- A *weather agent brief* with its own grader
+- A *tournament runner* that sends the same brief to multiple LLMs
+- A *structured summary format* that replaces prose with JSON
+
+** File Map
+
+| File                                     | Role                                     |
+|------------------------------------------+------------------------------------------|
+| =src/dmt/agent/brief.py=               | + WEATHER_BRIEF                          |
+| =src/dmt/agent/grader.py=              | + grade_weather, generic grading          |
+| =src/dmt/agent/tournament.py=          | Run N models x M briefs, collect results |
+| =scripts/run_tournament.py=            | CLI: run tournament, print leaderboard   |
+| =test/test_tournament.py=              | Tests for weather brief + tournament     |
+
+
+* The Weather Agent Brief
+
+The weather scenario uses different data, models, and column names — but the
+=evaluate()= call pattern is identical.  If the brief is sufficient, an agent
+that has never seen weather data should produce a correct LabReport.
+
+#+begin_src python :tangle ../src/dmt/agent/brief.py
+"""Structured agent briefs.
+
+A brief encodes:
+- What imports the agent has access to
+- What steps it must perform
+- What success looks like (grading criteria)
+"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AgentBrief:
+    """A machine-readable agent task specification."""
+
+    # Identity
+    name: str
+    description: str
+
+    # What the agent can import
+    imports: list[str] = field(default_factory=list)
+
+    # Step-by-step instructions
+    steps: list[str] = field(default_factory=list)
+
+    # Constraints
+    constraints: dict[str, str] = field(default_factory=dict)
+
+    # Success criteria (key -> human description)
+    success_criteria: dict[str, str] = field(default_factory=dict)
+
+    def to_prompt(self) -> str:
+        """Render the brief as a text prompt an LLM agent would receive."""
+        lines = [
+            f"**AGENT BRIEF: {self.name}**\n",
+            self.description + "\n",
+            "**Available imports**:",
+        ]
+        for imp in self.imports:
+            lines.append(f"- `{imp}`")
+        lines.append("\n**Your task**:")
+        for i, step in enumerate(self.steps, 1):
+            lines.append(f"{i}. {step}")
+        if self.constraints:
+            lines.append("\n**Constraints**:")
+            for key, val in self.constraints.items():
+                lines.append(f"- {key}: {val}")
+        if self.success_criteria:
+            lines.append("\n**Success criteria**:")
+            for key, val in self.success_criteria.items():
+                lines.append(f"- {key}: {val}")
+        return "\n".join(lines)
+
+
+# ── Pre-built briefs ──────────────────────────────────────────────────────
+
+DRUG_EFFICACY_BRIEF = AgentBrief(
+    name="Drug Efficacy Validation",
+    description=(
+        "You are a scientific computing agent. Your task is to evaluate "
+        "three drug efficacy models using the DMT validation framework."
+    ),
+    imports=[
+        "from dmt.evaluate import evaluate, DRUG_EFFICACY",
+        "from dmt.scenario.drug_efficacy import generate_observations, "
+        "LinearModel, SigmoidModel, CalibratedModel",
+    ],
+    steps=[
+        "Generate dose-response observations: obs = generate_observations()",
+        "Create three model instances: LinearModel(), SigmoidModel(), CalibratedModel()",
+        ("Call: evaluate(models=[linear, sigmoid, calibrated], "
+         "observations=obs, scenario=DRUG_EFFICACY, "
+         "reference_model=linear, output_dir=OUTPUT_DIR, "
+         "title='Drug Efficacy Model Comparison')"),
+        "Read the generated report.md and write a 3-sentence scientific summary to agent_summary.txt",
+    ],
+    constraints={
+        "reference_model": "Use LinearModel as the reference (baseline) model",
+        "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_drug_report/)",
+        "summary_requirements": (
+            "State which model is best, why, and what the key finding is"
+        ),
+    },
+    success_criteria={
+        "report_exists": "The report file exists at ./agent_drug_report/report.md",
+        "has_sections": (
+            "The report contains Abstract, Methods, Results, Discussion, Conclusion"
+        ),
+        "identifies_best": "Summary correctly identifies the Calibrated model as best",
+        "identifies_worst": (
+            "Summary notes that the Linear model fails on sigmoidal data"
+        ),
+    },
+)
+
+
+WEATHER_BRIEF = AgentBrief(
+    name="Weather Prediction Validation",
+    description=(
+        "You are a scientific computing agent. Your task is to evaluate "
+        "three weather prediction models using the DMT validation framework."
+    ),
+    imports=[
+        "from dmt.evaluate import evaluate, WEATHER",
+        "from dmt.scenario.weather import generate_observations, "
+        "PersistenceModel, ClimatologyModel, NoisyRegressionModel",
+    ],
+    steps=[
+        "Generate weather observations: obs = generate_observations(n_days=365, seed=42)",
+        ("Create three model instances: PersistenceModel(), "
+         "ClimatologyModel(), NoisyRegressionModel(alpha=0.7, noise_std=0.5)"),
+        ("Call: evaluate(models=[persistence, climatology, regression], "
+         "observations=obs, scenario=WEATHER, "
+         "reference_model=climatology, output_dir=OUTPUT_DIR, "
+         "title='Weather Prediction Model Comparison')"),
+        "Read the generated report.md and write a 3-sentence scientific summary to agent_summary.txt",
+    ],
+    constraints={
+        "reference_model": "Use ClimatologyModel as the reference (baseline) model",
+        "output_dir": "Use the path passed as sys.argv[1] (or default to ./agent_weather_report/)",
+        "summary_requirements": (
+            "State which model is best, why, and what the key finding is"
+        ),
+    },
+    success_criteria={
+        "report_exists": "The report file exists at the output directory",
+        "has_sections": (
+            "The report contains Abstract, Methods, Results, Discussion, Conclusion"
+        ),
+        "identifies_best": (
+            "Summary identifies NoisyRegression as the best model"
+        ),
+        "identifies_reference": (
+            "Summary mentions Climatology as the baseline or reference"
+        ),
+    },
+)
+#+end_src
+
+
+* The Grader — Now With Weather + Generic Support
+
+We expand the grader to handle both domains.  The key improvement: instead of
+domain-specific functions, we add a generic =grade_output= that takes a brief
+and checks the criteria programmatically.
+
+#+begin_src python :tangle ../src/dmt/agent/grader.py
+"""Grade an agent's output against success criteria."""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class CriterionResult:
+    """Result of evaluating a single success criterion."""
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass
+class GradeReport:
+    """Full grading report for an agent run."""
+    agent_name: str
+    criteria: list[CriterionResult] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        return all(c.passed for c in self.criteria)
+
+    @property
+    def pass_count(self) -> int:
+        return sum(1 for c in self.criteria if c.passed)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.criteria)
+
+    @property
+    def score(self) -> float:
+        if not self.criteria:
+            return 0.0
+        return self.pass_count / self.total_count
+
+    def summary(self) -> str:
+        lines = [
+            f"Agent: {self.agent_name}",
+            f"Score: {self.pass_count}/{self.total_count} "
+            f"({self.score:.0%})",
+            "",
+        ]
+        for c in self.criteria:
+            mark = "PASS" if c.passed else "FAIL"
+            lines.append(f"  [{mark}] {c.name}: {c.detail}")
+        return "\n".join(lines)
+
+
+# ── Semantic keyword matching ──────────────────────────────────────────────
+
+_POSITIVE_WORDS = frozenset({
+    "best", "lowest", "superior", "outperform", "outperforms",
+    "highest accuracy", "top", "winner", "strongest",
+})
+
+_NEGATIVE_WORDS = frozenset({
+    "worst", "fails", "failure", "poor", "poorest",
+    "highest rmse", "cannot capture", "inadequate",
+})
+
+
+def _text_contains_positive(text: str, entity: str) -> bool:
+    """Check if text positively identifies entity as the best."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _POSITIVE_WORDS)
+
+
+def _text_contains_negative(text: str, entity: str) -> bool:
+    """Check if text negatively identifies entity's limitations."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _NEGATIVE_WORDS)
+
+
+# ── Domain-specific graders ────────────────────────────────────────────────
+
+def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's drug efficacy validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Drug Efficacy Validation")
+    report_path = output_dir / "report.md"
+    summary_path = output_dir / "agent_summary.txt"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "identifies_best", "identifies_worst"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    report.criteria.append(CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    ))
+
+    # ── Criterion 3: Identifies Calibrated as best ────────────────────
+    summary_text = ""
+    if summary_path.exists():
+        summary_text = summary_path.read_text()
+
+    calibrated_best = _text_contains_positive(summary_text, "calibrated")
+    report.criteria.append(CriterionResult(
+        name="identifies_best",
+        passed=calibrated_best,
+        detail=(
+            "correctly identifies Calibrated" if calibrated_best
+            else "did not identify Calibrated as best model"
+        ),
+    ))
+
+    # ── Criterion 4: Notes Linear failure ─────────────────────────────
+    linear_fails = _text_contains_negative(summary_text, "linear")
+    # Also check for domain-specific reasoning
+    summary_lower = summary_text.lower()
+    if not linear_fails:
+        linear_fails = (
+            "linear" in summary_lower
+            and ("sigmoid" in summary_lower or "hill" in summary_lower)
+        )
+    report.criteria.append(CriterionResult(
+        name="identifies_worst",
+        passed=linear_fails,
+        detail=(
+            "correctly notes Linear failure" if linear_fails
+            else "did not explain Linear model's failure mode"
+        ),
+    ))
+
+    return report
+
+
+def grade_weather(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's weather prediction validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Weather Prediction Validation")
+    report_path = output_dir / "report.md"
+    summary_path = output_dir / "agent_summary.txt"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "identifies_best", "identifies_reference"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    report.criteria.append(CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    ))
+
+    # ── Criterion 3: Identifies NoisyRegression as best ───────────────
+    summary_text = ""
+    if summary_path.exists():
+        summary_text = summary_path.read_text()
+
+    regression_best = _text_contains_positive(summary_text, "regression")
+    # Also accept "NoisyRegression" as a variant
+    if not regression_best:
+        regression_best = _text_contains_positive(summary_text, "noisyregression")
+    report.criteria.append(CriterionResult(
+        name="identifies_best",
+        passed=regression_best,
+        detail=(
+            "correctly identifies NoisyRegression" if regression_best
+            else "did not identify NoisyRegression as best model"
+        ),
+    ))
+
+    # ── Criterion 4: Mentions Climatology as baseline ─────────────────
+    summary_lower = summary_text.lower()
+    climatology_ref = (
+        "climatology" in summary_lower
+        and ("baseline" in summary_lower or "reference" in summary_lower
+             or "benchmark" in summary_lower or "relative" in summary_lower
+             or "compared" in summary_lower or "skill" in summary_lower)
+    )
+    report.criteria.append(CriterionResult(
+        name="identifies_reference",
+        passed=climatology_ref,
+        detail=(
+            "correctly references Climatology baseline" if climatology_ref
+            else "did not mention Climatology as reference/baseline"
+        ),
+    ))
+
+    return report
+
+
+# ── Grader dispatch ────────────────────────────────────────────────────────
+
+GRADERS = {
+    "Drug Efficacy Validation": grade_drug_efficacy,
+    "Weather Prediction Validation": grade_weather,
+}
+
+
+def grade_output(brief_name: str, output_dir: str | Path) -> GradeReport:
+    """Grade agent output using the appropriate domain grader."""
+    grader = GRADERS.get(brief_name)
+    if grader is None:
+        raise ValueError(
+            f"No grader for brief '{brief_name}'. "
+            f"Available: {list(GRADERS.keys())}"
+        )
+    return grader(output_dir)
+#+end_src
+
+
+* The Tournament Runner
+
+The tournament sends the same brief to multiple LLMs and collects the
+grade reports.  It produces a leaderboard — a DataFrame comparing
+model scores across domains.
+
+#+begin_src python :tangle ../src/dmt/agent/tournament.py
+"""Run a tournament: multiple LLMs compete on the same brief.
+
+The tournament runner:
+1. Takes a list of (model_id, provider) pairs and a brief
+2. Sends the brief to each model
+3. Executes the generated code
+4. Grades each output
+5. Returns a leaderboard
+"""
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pandas as pd
+
+from dmt.agent.brief import AgentBrief
+from dmt.agent.grader import GradeReport, grade_output
+from dmt.agent.llm_runner import LLMResponse, run_llm_agent
+
+
+@dataclass
+class TournamentEntry:
+    """Result from one contestant in the tournament."""
+    model: str
+    brief_name: str
+    score: float
+    pass_count: int
+    total_count: int
+    code_valid: bool
+    execution_success: bool
+    elapsed_seconds: float
+    tokens_used: dict = field(default_factory=dict)
+    grade_report: GradeReport | None = None
+    error: str | None = None
+
+
+@dataclass
+class TournamentResult:
+    """Complete tournament results."""
+    entries: list[TournamentEntry] = field(default_factory=list)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        rows = []
+        for e in self.entries:
+            rows.append({
+                "model": e.model,
+                "brief": e.brief_name,
+                "score": f"{e.pass_count}/{e.total_count}",
+                "pct": f"{e.score:.0%}",
+                "code_valid": e.code_valid,
+                "executes": e.execution_success,
+                "time_s": f"{e.elapsed_seconds:.1f}",
+                "error": e.error or "",
+            })
+        return pd.DataFrame(rows)
+
+    def leaderboard(self) -> str:
+        df = self.to_dataframe()
+        return df.to_markdown(index=False)
+
+
+def run_tournament(
+    models: list[str],
+    briefs: list[AgentBrief],
+    output_root: str | Path = "./tournament_output",
+    timeout: int = 60,
+) -> TournamentResult:
+    """Run a tournament: each model attempts each brief.
+
+    Parameters
+    ----------
+    models : list of model IDs
+        e.g. ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"]
+    briefs : list of AgentBrief
+        The tasks to attempt.
+    output_root : path
+        Base directory for all outputs.
+    timeout : int
+        Max seconds per agent execution.
+
+    Returns TournamentResult with all entries.
+    """
+    output_root = Path(output_root)
+    result = TournamentResult()
+
+    for brief in briefs:
+        for model in models:
+            # Create a unique output directory per model+brief
+            safe_model = model.replace("/", "_").replace(":", "_")
+            safe_brief = brief.name.lower().replace(" ", "_")
+            output_dir = output_root / f"{safe_brief}_{safe_model}"
+
+            start = time.time()
+
+            try:
+                llm_response, agent_result = run_llm_agent(
+                    brief=brief,
+                    output_dir=output_dir,
+                    model=model,
+                    timeout=timeout,
+                )
+                elapsed = time.time() - start
+
+                # Check code validity
+                code_valid = True
+                try:
+                    compile(llm_response.extracted_code, "<agent>", "exec")
+                except SyntaxError:
+                    code_valid = False
+
+                # Grade
+                grade = grade_output(brief.name, output_dir)
+
+                entry = TournamentEntry(
+                    model=model,
+                    brief_name=brief.name,
+                    score=grade.score,
+                    pass_count=grade.pass_count,
+                    total_count=grade.total_count,
+                    code_valid=code_valid,
+                    execution_success=agent_result.success,
+                    elapsed_seconds=elapsed,
+                    tokens_used=llm_response.usage,
+                    grade_report=grade,
+                )
+
+            except Exception as e:
+                elapsed = time.time() - start
+                entry = TournamentEntry(
+                    model=model,
+                    brief_name=brief.name,
+                    score=0.0,
+                    pass_count=0,
+                    total_count=4,
+                    code_valid=False,
+                    execution_success=False,
+                    elapsed_seconds=elapsed,
+                    error=str(e),
+                )
+
+            result.entries.append(entry)
+            # Print progress
+            mark = "PASS" if entry.score == 1.0 else f"{entry.score:.0%}"
+            print(f"  [{mark}] {model} x {brief.name}")
+
+    return result
+#+end_src
+
+
+* The Tournament CLI
+
+#+begin_src python :tangle ../scripts/run_tournament.py
+"""Run a tournament across multiple models and briefs.
+
+Usage:
+    uv run --extra llm --extra dev python scripts/run_tournament.py
+"""
+
+import sys
+from pathlib import Path
+
+from dmt.agent.brief import DRUG_EFFICACY_BRIEF, WEATHER_BRIEF
+from dmt.agent.tournament import run_tournament
+
+
+def main():
+    output_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./tournament_output")
+
+    # Models to test — adjust based on available API keys
+    models = [
+        "claude-sonnet-4-20250514",
+        "claude-haiku-4-5-20251001",
+    ]
+
+    briefs = [DRUG_EFFICACY_BRIEF, WEATHER_BRIEF]
+
+    print("=" * 60)
+    print("  DMT-Eval Tournament")
+    print(f"  Models: {len(models)} | Briefs: {len(briefs)}")
+    print("=" * 60)
+    print()
+
+    result = run_tournament(
+        models=models,
+        briefs=briefs,
+        output_root=output_dir,
+    )
+
+    print()
+    print("=" * 60)
+    print("  LEADERBOARD")
+    print("=" * 60)
+    print()
+    print(result.leaderboard())
+    print()
+
+    # Print detailed grade reports
+    for entry in result.entries:
+        if entry.grade_report:
+            print(f"\n--- {entry.model} x {entry.brief_name} ---")
+            print(entry.grade_report.summary())
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+#+end_src
+
+
+* Tests
+
+Tests for the weather brief and the tournament infrastructure.  The tournament
+test uses the simulated agent (no API calls) to verify the plumbing.
+
+#+begin_src python :tangle ../test/test_tournament.py
+"""Tests for weather brief, tournament runner, and expanded grader."""
+
+from pathlib import Path
+
+import pytest
+
+from dmt.agent.brief import WEATHER_BRIEF, DRUG_EFFICACY_BRIEF
+from dmt.agent.grader import grade_weather, grade_drug_efficacy, grade_output
+
+
+# ── Weather brief tests ──────────────────────────────────────────────────────
+
+def test_weather_brief_is_complete():
+    """Weather brief should contain all necessary information."""
+    prompt = WEATHER_BRIEF.to_prompt()
+
+    assert "dmt.evaluate" in prompt
+    assert "dmt.scenario.weather" in prompt
+    assert "WEATHER" in prompt
+    assert "generate_observations" in prompt
+    assert "PersistenceModel" in prompt
+    assert "ClimatologyModel" in prompt
+    assert "NoisyRegressionModel" in prompt
+    assert "evaluate(models=" in prompt
+
+
+# ── Weather grader tests ─────────────────────────────────────────────────────
+
+def test_weather_grader_all_pass(tmp_path):
+    """Weather grader should pass when output is correct."""
+    # Create a minimal correct report
+    report = tmp_path / "report.md"
+    report.write_text(
+        "# Weather Report\n\n"
+        "## Abstract\n\nWe evaluate...\n\n"
+        "## Introduction\n\n...\n\n"
+        "## Methods\n\n...\n\n"
+        "## Results\n\n...\n\n"
+        "## Discussion\n\n...\n\n"
+        "## Conclusion\n\n...\n"
+    )
+    summary = tmp_path / "agent_summary.txt"
+    summary.write_text(
+        "The NoisyRegression model achieves the best performance "
+        "with the lowest RMSE across all cities. "
+        "Compared to the Climatology baseline, it shows significant "
+        "improvement in capturing day-to-day weather variability. "
+        "Persistence performs reasonably but cannot match the "
+        "regression model's skill."
+    )
+
+    grade = grade_weather(tmp_path)
+    assert grade.all_passed, grade.summary()
+    assert grade.score == 1.0
+
+
+def test_weather_grader_missing_report(tmp_path):
+    """Weather grader should handle missing report gracefully."""
+    grade = grade_weather(tmp_path)
+    assert grade.pass_count == 0
+    assert grade.total_count == 4
+
+
+# ── Generic grade_output dispatch ────────────────────────────────────────────
+
+def test_grade_output_dispatches_drug():
+    """grade_output should dispatch to the drug grader."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        grade = grade_output("Drug Efficacy Validation", tmp)
+        assert grade.agent_name == "Drug Efficacy Validation"
+
+
+def test_grade_output_dispatches_weather():
+    """grade_output should dispatch to the weather grader."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        grade = grade_output("Weather Prediction Validation", tmp)
+        assert grade.agent_name == "Weather Prediction Validation"
+
+
+def test_grade_output_unknown_raises():
+    """grade_output should raise for unknown brief names."""
+    with pytest.raises(ValueError, match="No grader"):
+        grade_output("Unknown Brief", "/tmp")
+
+
+# ── Simulated weather agent test ─────────────────────────────────────────────
+
+def test_simulated_weather_agent(tmp_path):
+    """A hand-written weather agent should score 4/4."""
+    from dmt.evaluate import evaluate, WEATHER
+    from dmt.scenario.weather import (
+        generate_observations,
+        PersistenceModel,
+        ClimatologyModel,
+        NoisyRegressionModel,
+    )
+
+    output_dir = tmp_path / "weather_output"
+
+    obs = generate_observations(n_days=365, seed=42)
+    persistence = PersistenceModel()
+    climatology = ClimatologyModel()
+    regression = NoisyRegressionModel(alpha=0.7, noise_std=0.5)
+
+    evaluate(
+        models=[persistence, climatology, regression],
+        observations=obs,
+        scenario=WEATHER,
+        reference_model=climatology,
+        output_dir=output_dir,
+        title="Weather Prediction Model Comparison",
+    )
+
+    # Write a correct summary
+    summary_path = output_dir / "agent_summary.txt"
+    summary_path.write_text(
+        "The NoisyRegression model achieves the lowest RMSE, "
+        "demonstrating the best predictive skill across all cities. "
+        "Relative to the Climatology baseline, it captures "
+        "day-to-day temperature variability that simpler models miss. "
+        "Persistence performs worst as it cannot adapt to seasonal shifts."
+    )
+
+    grade = grade_weather(output_dir)
+    assert grade.all_passed, grade.summary()
+#+end_src
+
+
+* What We've Built
+
+After this lesson, the DMT agent testing infrastructure has:
+
+| Component       | Lesson 03 | Lesson 04 | Lesson 05     |
+|-----------------+-----------+-----------+---------------|
+| Domains         | Drug only | Drug only | Drug + Weather |
+| Agent types     | Simulated | Live LLM  | Tournament    |
+| Grading         | Keywords  | Keywords  | Semantic      |
+| Models tested   | 0         | Sonnet    | N models      |
+| Briefs          | 1         | 1         | 2             |
+
+The tournament runner is ready.  When you run =scripts/run_tournament.py=
+with an API key, it will send both briefs to both Claude models and produce
+a leaderboard comparing them.
+
+
+* Requirements                                                     :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 05-tournament
+tag: lesson/05-tournament
+depends_on: 04-live-llm-agent
+files_created:
+  - src/dmt/agent/brief.py    # updated with WEATHER_BRIEF
+  - src/dmt/agent/grader.py   # updated with weather grader + semantic matching
+  - src/dmt/agent/tournament.py
+  - scripts/run_tournament.py
+  - test/test_tournament.py
+verification:
+  - "uv run --extra dev pytest test/ -v — all tests pass"
+  - "weather brief produces correct reports"
+  - "grade_output dispatches correctly"
+next_lesson: 06-structured-output
+#+end_src
+
+* Local Variables                                                  :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

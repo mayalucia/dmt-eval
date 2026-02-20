@@ -49,15 +49,41 @@ class GradeReport:
         return "\n".join(lines)
 
 
-def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
-    """Grade an agent's drug efficacy validation output.
+# ── Semantic keyword matching ──────────────────────────────────────────────
 
-    Checks the four success criteria from the brief:
-    1. Report file exists
-    2. Report has required sections
-    3. Summary identifies Calibrated as best
-    4. Summary identifies Linear as worst / failing on sigmoidal data
-    """
+_POSITIVE_WORDS = frozenset({
+    "best", "lowest", "superior", "outperform", "outperforms",
+    "highest accuracy", "top", "winner", "strongest",
+})
+
+_NEGATIVE_WORDS = frozenset({
+    "worst", "fails", "failure", "poor", "poorest",
+    "highest rmse", "cannot capture", "inadequate",
+})
+
+
+def _text_contains_positive(text: str, entity: str) -> bool:
+    """Check if text positively identifies entity as the best."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _POSITIVE_WORDS)
+
+
+def _text_contains_negative(text: str, entity: str) -> bool:
+    """Check if text negatively identifies entity's limitations."""
+    text = text.lower()
+    entity = entity.lower()
+    if entity not in text:
+        return False
+    return any(w in text for w in _NEGATIVE_WORDS)
+
+
+# ── Domain-specific graders ────────────────────────────────────────────────
+
+def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's drug efficacy validation output."""
     output_dir = Path(output_dir)
     report = GradeReport(agent_name="Drug Efficacy Validation")
     report_path = output_dir / "report.md"
@@ -72,7 +98,6 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     ))
 
     if not exists:
-        # Can't grade further without the report
         for name in ["has_sections", "identifies_best", "identifies_worst"]:
             report.criteria.append(CriterionResult(
                 name=name, passed=False, detail="skipped (no report)",
@@ -93,14 +118,9 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     # ── Criterion 3: Identifies Calibrated as best ────────────────────
     summary_text = ""
     if summary_path.exists():
-        summary_text = summary_path.read_text().lower()
+        summary_text = summary_path.read_text()
 
-    calibrated_best = (
-        "calibrated" in summary_text
-        and ("best" in summary_text or "lowest" in summary_text
-             or "superior" in summary_text or "outperform" in summary_text
-             or "highest accuracy" in summary_text)
-    )
+    calibrated_best = _text_contains_positive(summary_text, "calibrated")
     report.criteria.append(CriterionResult(
         name="identifies_best",
         passed=calibrated_best,
@@ -110,12 +130,15 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
         ),
     ))
 
-    # ── Criterion 4: Notes Linear failure on sigmoidal data ───────────
-    linear_fails = (
-        "linear" in summary_text
-        and ("sigmoid" in summary_text or "hill" in summary_text
-             or "fails" in summary_text or "worst" in summary_text)
-    )
+    # ── Criterion 4: Notes Linear failure ─────────────────────────────
+    linear_fails = _text_contains_negative(summary_text, "linear")
+    # Also check for domain-specific reasoning
+    summary_lower = summary_text.lower()
+    if not linear_fails:
+        linear_fails = (
+            "linear" in summary_lower
+            and ("sigmoid" in summary_lower or "hill" in summary_lower)
+        )
     report.criteria.append(CriterionResult(
         name="identifies_worst",
         passed=linear_fails,
@@ -126,3 +149,93 @@ def grade_drug_efficacy(output_dir: str | Path) -> GradeReport:
     ))
 
     return report
+
+
+def grade_weather(output_dir: str | Path) -> GradeReport:
+    """Grade an agent's weather prediction validation output."""
+    output_dir = Path(output_dir)
+    report = GradeReport(agent_name="Weather Prediction Validation")
+    report_path = output_dir / "report.md"
+    summary_path = output_dir / "agent_summary.txt"
+
+    # ── Criterion 1: Report exists ────────────────────────────────────
+    exists = report_path.exists()
+    report.criteria.append(CriterionResult(
+        name="report_exists",
+        passed=exists,
+        detail=str(report_path) if exists else "report.md not found",
+    ))
+
+    if not exists:
+        for name in ["has_sections", "identifies_best", "identifies_reference"]:
+            report.criteria.append(CriterionResult(
+                name=name, passed=False, detail="skipped (no report)",
+            ))
+        return report
+
+    report_text = report_path.read_text()
+
+    # ── Criterion 2: Has required sections ────────────────────────────
+    required = ["Abstract", "Methods", "Results", "Discussion", "Conclusion"]
+    missing = [s for s in required if f"## {s}" not in report_text]
+    report.criteria.append(CriterionResult(
+        name="has_sections",
+        passed=len(missing) == 0,
+        detail="all present" if not missing else f"missing: {missing}",
+    ))
+
+    # ── Criterion 3: Identifies NoisyRegression as best ───────────────
+    summary_text = ""
+    if summary_path.exists():
+        summary_text = summary_path.read_text()
+
+    regression_best = _text_contains_positive(summary_text, "regression")
+    # Also accept "NoisyRegression" as a variant
+    if not regression_best:
+        regression_best = _text_contains_positive(summary_text, "noisyregression")
+    report.criteria.append(CriterionResult(
+        name="identifies_best",
+        passed=regression_best,
+        detail=(
+            "correctly identifies NoisyRegression" if regression_best
+            else "did not identify NoisyRegression as best model"
+        ),
+    ))
+
+    # ── Criterion 4: Mentions Climatology as baseline ─────────────────
+    summary_lower = summary_text.lower()
+    climatology_ref = (
+        "climatology" in summary_lower
+        and ("baseline" in summary_lower or "reference" in summary_lower
+             or "benchmark" in summary_lower or "relative" in summary_lower
+             or "compared" in summary_lower or "skill" in summary_lower)
+    )
+    report.criteria.append(CriterionResult(
+        name="identifies_reference",
+        passed=climatology_ref,
+        detail=(
+            "correctly references Climatology baseline" if climatology_ref
+            else "did not mention Climatology as reference/baseline"
+        ),
+    ))
+
+    return report
+
+
+# ── Grader dispatch ────────────────────────────────────────────────────────
+
+GRADERS = {
+    "Drug Efficacy Validation": grade_drug_efficacy,
+    "Weather Prediction Validation": grade_weather,
+}
+
+
+def grade_output(brief_name: str, output_dir: str | Path) -> GradeReport:
+    """Grade agent output using the appropriate domain grader."""
+    grader = GRADERS.get(brief_name)
+    if grader is None:
+        raise ValueError(
+            f"No grader for brief '{brief_name}'. "
+            f"Available: {list(GRADERS.keys())}"
+        )
+    return grader(output_dir)
