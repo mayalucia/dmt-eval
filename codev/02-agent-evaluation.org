@@ -1,0 +1,673 @@
+#+title: Lesson 02 — Agents Evaluate DMT
+#+subtitle: A second domain proves generality; agent briefs test the interface
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+Lesson 01 built a weather validation prototype.  It works — 19 tests pass, a
+structured LabReport is generated.  But the =evaluate()= function is
+weather-specific: it hardcodes column names (=city=, =season=, =temperature=),
+merge keys, and narrative text about forecasting.
+
+If DMT is truly domain-agnostic, it must work for a /second/ domain with zero
+changes to the core.  This lesson proves that by building a drug efficacy
+scenario — dose-response curves for competing pharmaceutical compounds —
+using only the public DMT API.
+
+Then we go further: we write /agent briefs/ — instructions that an AI agent
+would receive to perform the same task independently.  The brief is the test:
+if the instructions + API are sufficient for an autonomous agent to produce a
+coherent LabReport, then DMT's interface design is right.
+
+** The Two-Part Structure
+
+1. *Refactor*: Make =evaluate()= domain-agnostic.  The domain provides a
+   /scenario descriptor/ — column names, merge keys, group-by fields, narrative
+   templates.  The evaluator is just the engine.
+
+2. *Drug Efficacy Scenario*: Synthetic dose-response data for three compounds.
+   Three "models" predict efficacy at each dose.  The validation compares them.
+
+3. *Agent Brief*: A self-contained instruction document that an AI agent
+   receives.  It references only DMT's public API and the scenario data.
+
+** File Map
+
+| File                                | Role                                       |
+|-------------------------------------+--------------------------------------------|
+| =src/dmt/evaluate.py=              | Refactored domain-agnostic evaluator       |
+| =src/dmt/scenario/drug_efficacy.py= | Synthetic dose-response data + toy models |
+| =test/test_drug_efficacy.py=       | End-to-end test for the second domain      |
+| =test/test_weather_still_works.py= | Regression: weather scenario unchanged     |
+
+
+* Refactoring: The Domain-Agnostic Evaluator
+
+The key insight: every validation scenario has the same shape:
+
+1. Observations with some /entity/ column (city, compound, patient) and a
+   /measured value/ column (temperature, efficacy, return).
+2. Optional /grouping/ columns for stratification (season, dose, sector).
+3. Models that produce /predictions/ aligned to observations.
+4. Metrics that compare predicted vs observed.
+
+We extract this into a =ScenarioDescriptor= — a plain dataclass that tells
+the evaluator which columns are which.
+
+#+begin_src python :tangle ../src/dmt/evaluate.py
+"""The Level 0 entry point: dmt.evaluate().
+
+Domain-agnostic: the scenario descriptor tells the evaluator which
+columns are which.  The evaluator is just the engine.
+"""
+
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from dmt.document.renderer import render_markdown
+
+
+# ── Metrics (inlined for zero-dependency core) ──────────────────────────────
+
+def _rmse(observed: np.ndarray, predicted: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((observed - predicted) ** 2)))
+
+
+def _bias(observed: np.ndarray, predicted: np.ndarray) -> float:
+    return float(np.mean(predicted - observed))
+
+
+def _skill_score(model_rmse: float, reference_rmse: float) -> float:
+    if reference_rmse == 0:
+        return 0.0
+    return float(1.0 - model_rmse / reference_rmse)
+
+
+# ── Scenario Descriptor ────────────────────────────────────────────────────
+
+@dataclass
+class Scenario:
+    """Describes the shape of a validation scenario.
+
+    This is how a domain tells DMT which columns matter.
+    """
+    # Column names
+    observed_col: str = "observed"
+    predicted_col: str = "predicted"
+    entity_col: str = "entity"
+    merge_on: list[str] = field(default_factory=lambda: ["entity", "step"])
+
+    # Grouping for stratified analysis
+    group_by: list[str] = field(default_factory=lambda: ["entity"])
+
+    # Narrative templates
+    domain_name: str = "model"
+    observation_description: str = "observations"
+    entity_description: str = "entities"
+
+
+# ── Pre-built scenarios ────────────────────────────────────────────────────
+
+WEATHER = Scenario(
+    observed_col="temperature",
+    predicted_col="predicted",
+    entity_col="city",
+    merge_on=["city", "day", "season"],
+    group_by=["city", "season"],
+    domain_name="weather prediction",
+    observation_description="synthetic daily temperature observations",
+    entity_description="European cities",
+)
+
+DRUG_EFFICACY = Scenario(
+    observed_col="efficacy",
+    predicted_col="predicted",
+    entity_col="compound",
+    merge_on=["compound", "dose"],
+    group_by=["compound", "dose"],
+    domain_name="drug efficacy prediction",
+    observation_description="dose-response efficacy measurements",
+    entity_description="pharmaceutical compounds",
+)
+
+
+# ── The evaluator ──────────────────────────────────────────────────────────
+
+def _compute_metrics(merged: pd.DataFrame, obs_col: str, pred_col: str,
+                     reference_rmse: float | None = None) -> dict:
+    """Compute RMSE, bias, skill score on a merged DataFrame."""
+    observed = merged[obs_col].values
+    predicted = merged[pred_col].values
+    result = {
+        "rmse": _rmse(observed, predicted),
+        "bias": _bias(observed, predicted),
+    }
+    if reference_rmse is not None:
+        result["skill_score"] = _skill_score(result["rmse"], reference_rmse)
+    return result
+
+
+def _compute_by_group(merged: pd.DataFrame, obs_col: str, pred_col: str,
+                      group_col: str, reference_rmse: float | None = None
+                      ) -> pd.DataFrame:
+    """Compute metrics broken down by a grouping column."""
+    rows = []
+    for val, grp in merged.groupby(group_col):
+        row = {group_col: val}
+        row.update(_compute_metrics(grp, obs_col, pred_col, reference_rmse))
+        row["n"] = len(grp)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def evaluate(
+    models: list,
+    observations: pd.DataFrame,
+    scenario: Scenario | None = None,
+    reference_model=None,
+    output_dir: str | Path = "./dmt_report",
+    title: str = "Model Evaluation Report",
+) -> Path:
+    """Evaluate models against observations and produce a LabReport.
+
+    Parameters
+    ----------
+    models : list of model objects
+        Each must have .name (str) and .predict(observations) -> DataFrame.
+    observations : DataFrame
+        Ground truth.
+    scenario : Scenario
+        Describes column names, merge keys, and grouping.
+        If None, attempts to auto-detect (falls back to WEATHER).
+    reference_model : optional
+        Baseline for skill scores.  If None, uses models[0].
+    output_dir : path
+        Where to write the report.
+    title : str
+        Report title.
+
+    Returns the path to the generated report.
+    """
+    if scenario is None:
+        scenario = WEATHER
+
+    obs_col = scenario.observed_col
+    pred_col = scenario.predicted_col
+    merge_on = scenario.merge_on
+    entity_col = scenario.entity_col
+
+    reference = reference_model or models[0]
+    ref_predictions = reference.predict(observations)
+    ref_merged = observations.merge(ref_predictions, on=merge_on)
+    reference_rmse = _rmse(ref_merged[obs_col].values,
+                           ref_merged[pred_col].values)
+
+    # ── Run all models ──────────────────────────────────────────────────
+    all_summary = []
+    all_by_group = {}
+
+    for model in models:
+        predictions = model.predict(observations)
+        merged = observations.merge(predictions, on=merge_on)
+        summary = _compute_metrics(merged, obs_col, pred_col, reference_rmse)
+        summary["model"] = model.name
+        all_summary.append(summary)
+
+        for group_col in scenario.group_by:
+            if group_col not in all_by_group:
+                all_by_group[group_col] = []
+            by_g = _compute_by_group(merged, obs_col, pred_col,
+                                     group_col, reference_rmse)
+            by_g["model"] = model.name
+            all_by_group[group_col].append(by_g)
+
+    summary_df = pd.DataFrame(all_summary)[["model", "rmse", "bias", "skill_score"]]
+    grouped_dfs = {
+        col: pd.concat(frames, ignore_index=True)
+        for col, frames in all_by_group.items()
+    }
+
+    # ── Assemble sections ───────────────────────────────────────────────
+    sections = OrderedDict()
+
+    n_entities = observations[entity_col].nunique()
+    sections["abstract"] = {
+        "name": "Abstract",
+        "narrative": (
+            f"We evaluate {len(models)} {scenario.domain_name} models against "
+            f"{scenario.observation_description} for "
+            f"{n_entities} {scenario.entity_description}.  "
+            f"Models are compared using RMSE, bias, and skill score "
+            f"(relative to {reference.name})."
+        ),
+    }
+
+    sections["introduction"] = {
+        "name": "Introduction",
+        "narrative": (
+            f"This report compares {len(models)} models on a "
+            f"{scenario.domain_name} task:\n\n"
+            + "\n".join(f"- **{m.name}**" for m in models)
+        ),
+    }
+
+    sections["methods"] = {
+        "name": "Methods",
+        "narrative": (
+            "**Metrics**:\n\n"
+            "- *RMSE*: Root mean square error.  Lower is better.\n"
+            "- *Bias*: Mean (predicted - observed).  Zero is unbiased.\n"
+            f"- *Skill Score*: 1 - RMSE_model / RMSE_{reference.name}.  "
+            "Positive means the model beats the reference.\n\n"
+            f"**Grouping**: Results are stratified by "
+            + ", ".join(scenario.group_by) + "."
+        ),
+    }
+
+    sections["results"] = {
+        "name": "Results",
+        "narrative": "### Overall Performance",
+        "data": summary_df,
+    }
+
+    for group_col, gdf in grouped_dfs.items():
+        label = f"results_by_{group_col}"
+        sections[label] = {
+            "name": f"Results by {group_col.replace('_', ' ').title()}",
+            "narrative": (
+                f"Performance broken down by {group_col}."
+            ),
+            "data": gdf,
+        }
+
+    # ── Discussion: find best model overall and per group ──────────────
+    best_overall = summary_df.loc[summary_df["rmse"].idxmin(), "model"]
+    discussion_parts = [
+        f"**{best_overall}** achieves the lowest overall RMSE.\n",
+    ]
+    for group_col, gdf in grouped_dfs.items():
+        for val in gdf[group_col].unique():
+            subset = gdf[gdf[group_col] == val]
+            if not subset.empty:
+                best = subset.loc[subset["rmse"].idxmin(), "model"]
+                discussion_parts.append(
+                    f"- *{group_col}={val}*: best is **{best}**")
+
+    sections["discussion"] = {
+        "name": "Discussion",
+        "narrative": "\n".join(discussion_parts),
+    }
+
+    sections["conclusion"] = {
+        "name": "Conclusion",
+        "narrative": (
+            f"This evaluation compared {len(models)} models on a "
+            f"{scenario.domain_name} task, producing metrics with "
+            f"stratification by {', '.join(scenario.group_by)}.  "
+            f"The report was generated automatically by DMT."
+        ),
+    }
+
+    return render_markdown(title, sections, output_dir)
+#+end_src
+
+
+* The Drug Efficacy Scenario
+
+** The Science
+
+A dose-response curve models how a drug's effect changes with concentration.
+The standard model is the Hill equation (sigmoid):
+
+$$E(d) = E_{\max} \cdot \frac{d^n}{d^n + \text{IC50}^n}$$
+
+where $E_{\max}$ is the maximum effect, $\text{IC50}$ is the concentration
+producing 50% of maximum effect, and $n$ is the Hill coefficient (steepness).
+
+We simulate three compounds with different characteristics:
+
+| Compound   | IC50 | E_max | Hill coeff | Character                   |
+|------------+------+-------+------------+-----------------------------|
+| AlphaBlock | 5.0  | 95%   | 1.5        | Potent, gradual onset       |
+| BetaCure   | 15.0 | 85%   | 2.5        | Less potent, steep response |
+| GammaLite  | 8.0  | 70%   | 1.0        | Moderate, shallow response  |
+
+Three "models" predict these curves with varying accuracy:
+
+1. *LinearModel* — assumes dose-response is linear.  Terrible for sigmoidal
+   data, but the simplest possible model.
+2. *SigmoidModel* — fits a Hill equation but with deliberately wrong parameters
+   (simulating a model trained on a different dataset).
+3. *CalibratedModel* — uses parameters close to the true values, with small
+   noise.
+
+#+begin_src python :tangle ../src/dmt/scenario/drug_efficacy.py
+"""Synthetic dose-response data and toy pharmacological models.
+
+The ground truth follows Hill equation kinetics.  Three models of
+increasing sophistication attempt to predict efficacy at each dose.
+"""
+
+from dataclasses import dataclass, field
+import numpy as np
+import pandas as pd
+
+
+# ── Compound parameters ──────────────────────────────────────────────────────
+
+COMPOUNDS = {
+    "AlphaBlock": {"ic50": 5.0,  "e_max": 95.0, "hill_n": 1.5},
+    "BetaCure":   {"ic50": 15.0, "e_max": 85.0, "hill_n": 2.5},
+    "GammaLite":  {"ic50": 8.0,  "e_max": 70.0, "hill_n": 1.0},
+}
+
+
+def hill_equation(dose: float, ic50: float, e_max: float, hill_n: float) -> float:
+    """Standard Hill equation for dose-response."""
+    if dose <= 0:
+        return 0.0
+    return e_max * (dose ** hill_n) / (dose ** hill_n + ic50 ** hill_n)
+
+
+def generate_observations(
+    compounds: dict | None = None,
+    doses: list[float] | None = None,
+    n_replicates: int = 5,
+    noise_std: float = 3.0,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Generate synthetic dose-response observations.
+
+    Returns a DataFrame with columns: compound, dose, efficacy, replicate.
+    """
+    rng = np.random.default_rng(seed)
+    compounds = compounds or COMPOUNDS
+    if doses is None:
+        doses = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+
+    rows = []
+    for compound, params in compounds.items():
+        for dose in doses:
+            true_effect = hill_equation(dose, **params)
+            for rep in range(n_replicates):
+                observed = true_effect + rng.normal(0, noise_std)
+                observed = max(0.0, min(100.0, observed))  # clamp to [0, 100]
+                rows.append({
+                    "compound": compound,
+                    "dose": dose,
+                    "efficacy": float(observed),
+                    "replicate": rep,
+                })
+    return pd.DataFrame(rows)
+
+
+# ── Toy Models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class LinearModel:
+    """Assumes efficacy is linear in dose.  The worst possible model."""
+    name: str = "Linear"
+    slope: float = 0.8
+    intercept: float = 5.0
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for _, row in observations.iterrows():
+            pred = min(100.0, self.intercept + self.slope * row["dose"])
+            rows.append({
+                "compound": row["compound"],
+                "dose": row["dose"],
+                "predicted": float(pred),
+            })
+        return pd.DataFrame(rows)
+
+
+@dataclass
+class SigmoidModel:
+    """Hill equation with wrong parameters (trained on different data)."""
+    name: str = "Sigmoid(miscalibrated)"
+    # Deliberately offset from true values
+    ic50_offset: float = 3.0
+    e_max_offset: float = -10.0
+    hill_n_override: float = 1.0
+    compounds: dict = field(default_factory=lambda: COMPOUNDS)
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for _, row in observations.iterrows():
+            params = self.compounds[row["compound"]]
+            pred = hill_equation(
+                row["dose"],
+                ic50=params["ic50"] + self.ic50_offset,
+                e_max=params["e_max"] + self.e_max_offset,
+                hill_n=self.hill_n_override,
+            )
+            rows.append({
+                "compound": row["compound"],
+                "dose": row["dose"],
+                "predicted": float(pred),
+            })
+        return pd.DataFrame(rows)
+
+
+@dataclass
+class CalibratedModel:
+    """Hill equation with near-correct parameters + small noise."""
+    name: str = "Calibrated"
+    noise_std: float = 1.5
+    compounds: dict = field(default_factory=lambda: COMPOUNDS)
+    seed: int = 99
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        rng = np.random.default_rng(self.seed)
+        rows = []
+        for _, row in observations.iterrows():
+            params = self.compounds[row["compound"]]
+            pred = hill_equation(row["dose"], **params) + rng.normal(0, self.noise_std)
+            pred = max(0.0, min(100.0, pred))
+            rows.append({
+                "compound": row["compound"],
+                "dose": row["dose"],
+                "predicted": float(pred),
+            })
+        return pd.DataFrame(rows)
+#+end_src
+
+
+* The Drug Efficacy Test
+
+This test proves DMT works on a completely different domain with zero changes
+to the core evaluator — only a different =Scenario= descriptor.
+
+#+begin_src python :tangle ../test/test_drug_efficacy.py
+"""End-to-end test: drug efficacy scenario using the domain-agnostic evaluator."""
+
+from pathlib import Path
+
+from dmt.scenario.drug_efficacy import (
+    generate_observations,
+    LinearModel,
+    SigmoidModel,
+    CalibratedModel,
+)
+from dmt.evaluate import evaluate, DRUG_EFFICACY
+
+
+def test_drug_efficacy_scenario(tmp_path):
+    """Full pipeline: dose-response data -> models -> evaluate -> report."""
+    obs = generate_observations()
+    assert "compound" in obs.columns
+    assert "dose" in obs.columns
+    assert "efficacy" in obs.columns
+
+    linear = LinearModel()
+    sigmoid = SigmoidModel()
+    calibrated = CalibratedModel()
+
+    report_dir = tmp_path / "drug_report"
+    report_path = evaluate(
+        models=[linear, sigmoid, calibrated],
+        observations=obs,
+        scenario=DRUG_EFFICACY,
+        reference_model=linear,
+        output_dir=report_dir,
+        title="Drug Efficacy Model Comparison",
+    )
+
+    assert report_path.exists()
+    report_text = report_path.read_text()
+
+    # Report structure
+    assert "# Drug Efficacy Model Comparison" in report_text
+    assert "## Abstract" in report_text
+    assert "## Methods" in report_text
+    assert "## Results" in report_text
+    assert "## Discussion" in report_text
+
+    # All models present
+    assert "Linear" in report_text
+    assert "Sigmoid(miscalibrated)" in report_text
+    assert "Calibrated" in report_text
+
+    # Domain-specific terms from the scenario descriptor
+    assert "drug efficacy prediction" in report_text
+    assert "pharmaceutical compounds" in report_text
+
+
+def test_calibrated_beats_linear():
+    """The calibrated Hill model should crush the linear model."""
+    obs = generate_observations()
+
+    from dmt.evaluate import _rmse
+    linear = LinearModel()
+    calibrated = CalibratedModel()
+
+    l_pred = linear.predict(obs)
+    c_pred = calibrated.predict(obs)
+
+    l_merged = obs.merge(l_pred, on=["compound", "dose"])
+    c_merged = obs.merge(c_pred, on=["compound", "dose"])
+
+    l_rmse = _rmse(l_merged["efficacy"].values, l_merged["predicted"].values)
+    c_rmse = _rmse(c_merged["efficacy"].values, c_merged["predicted"].values)
+
+    assert c_rmse < l_rmse, (
+        f"Calibrated RMSE ({c_rmse:.2f}) should be less than "
+        f"Linear RMSE ({l_rmse:.2f})"
+    )
+#+end_src
+
+
+* Weather Regression Test
+
+We must verify that the refactored evaluator still produces correct weather
+reports.  This test is identical to the one from Lesson 01 but uses the
+new =Scenario= interface explicitly.
+
+#+begin_src python :tangle ../test/test_weather_regression.py
+"""Regression test: weather scenario still works after evaluate() refactor."""
+
+from dmt.scenario.weather import (
+    generate_observations,
+    PersistenceModel,
+    ClimatologyModel,
+    NoisyRegressionModel,
+)
+from dmt.evaluate import evaluate, WEATHER
+
+
+def test_weather_still_works(tmp_path):
+    """Weather scenario produces correct report with refactored evaluator."""
+    obs = generate_observations(n_days=365, seed=42)
+
+    report_path = evaluate(
+        models=[PersistenceModel(), ClimatologyModel(),
+                NoisyRegressionModel(alpha=0.7, noise_std=0.5)],
+        observations=obs,
+        scenario=WEATHER,
+        reference_model=ClimatologyModel(),
+        output_dir=tmp_path / "weather_regression",
+        title="Weather Regression Test",
+    )
+
+    report_text = report_path.read_text()
+
+    assert "## Abstract" in report_text
+    assert "## Results" in report_text
+    assert "Persistence" in report_text
+    assert "Climatology" in report_text
+    assert "NoisyRegression" in report_text
+    assert "weather prediction" in report_text
+#+end_src
+
+
+* The Agent Brief
+
+This section contains the instruction document that an AI agent would receive.
+It references only DMT's public API and a data file.  It is the /test of our
+interface design/: is this enough for an agent to succeed?
+
+The brief is written here but not tangled — it lives in the org narrative as a
+specification.  In Lesson 03 we will actually hand it to an agent.
+
+#+begin_quote
+*AGENT BRIEF: Drug Efficacy Validation*
+
+You are a scientific computing agent.  Your task is to evaluate three drug
+efficacy models using the DMT validation framework.
+
+*Available tools*:
+- =from dmt.evaluate import evaluate, DRUG_EFFICACY=
+- =from dmt.scenario.drug_efficacy import generate_observations, LinearModel, SigmoidModel, CalibratedModel=
+
+*Your task*:
+1. Generate dose-response observations using =generate_observations()=
+2. Create three model instances: =LinearModel()=, =SigmoidModel()=, =CalibratedModel()=
+3. Call =evaluate()= with the =DRUG_EFFICACY= scenario descriptor
+4. Read the generated report and write a 3-sentence scientific summary
+
+*Constraints*:
+- Use =LinearModel= as the reference (baseline) model
+- Output the report to =./agent_drug_report/=
+- Your summary should state: which model is best, why, and what the key finding is
+
+*Success criteria*:
+- The report file exists at =./agent_drug_report/report.md=
+- The report contains Abstract, Methods, Results, Discussion, Conclusion
+- Your summary correctly identifies the Calibrated model as best
+- Your summary notes that the Linear model fails on sigmoidal data
+#+end_quote
+
+The brief is intentionally short.  An agent that needs more than this to
+produce a LabReport is telling us that the API has too much friction.
+
+
+* Requirements for Agents                                        :noexport:
+
+#+begin_src yaml :tangle no
+lesson: 02-agent-evaluation
+tag: lesson/02-agent-evaluation
+depends_on: 01-weather-scenario
+files_created:
+  - src/dmt/evaluate.py   # refactored, domain-agnostic
+  - src/dmt/scenario/drug_efficacy.py
+  - test/test_drug_efficacy.py
+  - test/test_weather_regression.py
+verification:
+  - "uv run --extra dev pytest test/ -v — all tests pass"
+  - "drug efficacy report contains all expected sections"
+  - "weather regression test passes (no breakage from refactor)"
+next_lesson: 03-live-agent-test
+#+end_src
+
+* Local Variables                                                :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:
