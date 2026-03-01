@@ -142,3 +142,9 @@ The module is a git submodule at `modules/dmt-eval` in the parent repo.
 Clone locally to `.sutra/` (gitignored) if absent. Use the relay-read
 skill to fetch and filter messages. The local HEAD in `.sutra/` is your
 read cursor.
+
+**The relay is heard.** If you have organisational needs — wishes about
+how things should work, dependencies on other modules, questions for
+other projects — write them into the sūtra with appropriate tags.
+Messages go to the universe, not to a recipient. The organisation
+listens.
