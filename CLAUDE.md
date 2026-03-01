@@ -45,7 +45,17 @@ dmt-eval/                         <- git root
 │   ├── metrics/                  <- built-in metrics
 │   ├── plot/                     <- plotting utilities
 │   └── domains/                  <- domain-specific packs
+│       └── brainscore/           <- Brain-Score domain adapter
+│           ├── interface.py      <- Interface base (via __init_subclass__)
+│           ├── brain_model.py    <- BrainModelInterface, BenchmarkInterface
+│           ├── registry.py       <- PluginRegistry (validated, per-interface)
+│           ├── adapter.py        <- @adapts, @implements decorators
+│           ├── plugin.py         <- ModelPlugin, BenchmarkPlugin + registries
+│           ├── compat.py         <- Bridge to Brain-Score's own registries
+│           ├── literate/         <- Org source of truth (00-07)
+│           └── examples/         <- AlexNet adapter, benchmark runner
 ├── test/                         <- test files (tangled from codev/ + standalone)
+│   └── brainscore/               <- brain-score domain tests
 ├── Makefile                      <- tangle, test, clean
 ├── pyproject.toml
 └── CLAUDE.md                     <- this file
@@ -88,6 +98,24 @@ Do not over-explain. Do not be sycophantic. Push back on flawed reasoning.
 - Do not push unless asked
 - Commit messages: imperative mood, concise
 
+### Brain-Score Domain (`src/dmt/domains/brainscore/`)
+
+The first domain adapter, implementing DMT's interface/adapter pattern for
+[Brain-Score](https://www.brain-score.org/) — a neuroscience model validation
+platform. Key design choices:
+
+- **`__init_subclass__` instead of metaclasses**: The original DMT (BBP era) used
+  `InterfaceMeta` — a custom metaclass that caused MRO conflicts. This version uses
+  `__init_subclass__` hooks: simpler, no metaclass composition needed.
+- **Per-interface registries**: DMT's original `InterfaceMeta` had a shared mutable
+  `__implementation_registry__` across all interfaces (bug). Fixed here.
+- **`@implements` decorator**: Validates compliance at registration time, not runtime.
+- **Compatibility bridge** (`compat.py`): `sync_to_brainscore()` maps DMT-registered
+  plugins to Brain-Score's own registry format.
+
+Literate sources for this domain live in `src/dmt/domains/brainscore/literate/`
+(00-07). Tutorials about Brain-Score itself are in `codev/` (08-12).
+
 ### Relationship to BBP-era DMT
 
 The original framework lives at `visood/dmt` (private). This repo inherits the
@@ -101,3 +129,14 @@ proven architectural ideas and rebuilds with modern Python:
 | Neuroscience-coupled            | Domain-agnostic core + domain packs|
 | No CLI                          | `typer` CLI                        |
 | No packaging                    | `pyproject.toml`, `uv`, PyPI       |
+
+### Organisational Context
+
+This module belongs to the **bravli** guild (computational neuroscience)
+within the MāyāLucIA organisation. Its guardian spirit is `dmt-eval-guardian`
+(see `aburaya/spirits/dmt-eval-guardian/` in the parent repo).
+
+The module is a git submodule at `modules/dmt-eval` in the parent repo.
+
+**Sūtra relay**: Use the relay-read skill to check for organisational
+messages relevant to this project.
