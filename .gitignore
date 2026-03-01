@@ -28,5 +28,8 @@ agent_drug_report/
 llm_agent_output/
 tournament_output/
 
+# Sūtra relay clone (per-project harness, local cursor)
+.sutra/
+
 # OS
 .DS_Store
