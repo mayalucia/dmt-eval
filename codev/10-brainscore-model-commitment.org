@@ -1,0 +1,528 @@
+#+title: Brain-Score Tutorial 03 — ModelCommitment and the Adapter Pattern
+#+author: Vishal Sood
+#+date: <2026-02-27 Fri>
+#+options: toc:t num:t
+
+* What This Tutorial Covers
+
+How a standard PyTorch model (e.g., =torchvision.models.alexnet()=) becomes
+a =BrainModel= that benchmarks can interact with. This is the *Adapter Pattern*:
+=ModelCommitment= wraps any model that produces activations into a standardized
+interface that speaks the language of neuroscience experiments.
+
+* The Problem
+
+A benchmark needs to:
+1. Tell a model /where/ to record (e.g., "record from IT")
+2. Show it stimuli (images)
+3. Get back neural-like responses (activations shaped as =presentation × neuroid=)
+4. Optionally, get behavioral responses (labels, probabilities)
+
+A PyTorch model knows none of this. It takes a tensor, runs a forward pass,
+returns logits. The gap between these two worlds is bridged by =ModelCommitment=.
+
+* The =BrainModel= Interface
+
+Every model submitted to Brain-Score must implement this interface:
+
+#+begin_src python
+# brainscore_vision/model_interface.py
+
+class BrainModel:
+    @property
+    def identifier(self) -> str:
+        """Unique model name, e.g. 'alexnet'."""
+        ...
+
+    def visual_degrees(self) -> int:
+        """How many visual degrees the model's input subtends (default 8)."""
+        ...
+
+    class Task:
+        passive     = 'passive'       # Neural recording (no task)
+        label       = 'label'         # Classification labels
+        probabilities = 'probabilities'  # Class probabilities
+        odd_one_out = 'odd_one_out'   # Odd-one-out judgments
+
+    def start_task(self, task: Task, fitting_stimuli) -> None:
+        """Tell the model what task to perform."""
+        ...
+
+    class RecordingTarget:
+        V1 = 'V1'
+        V2 = 'V2'
+        V4 = 'V4'
+        IT = 'IT'
+
+    def start_recording(self, recording_target: RecordingTarget,
+                        time_bins: List[Tuple[int, int]]) -> None:
+        """Tell the model which brain region to record from."""
+        ...
+
+    def look_at(self, stimuli: Union[StimulusSet, List[str]],
+                number_of_trials=1) -> Union[BehavioralAssembly, NeuroidAssembly]:
+        """Present stimuli and return responses."""
+        ...
+#+end_src
+
+The design is deliberately neuroscience-flavored: you /start recording/,
+then you /look at/ stimuli. This mirrors the experimental protocol where
+you first set up electrodes (recording target), then present images.
+
+* =ModelCommitment=: The Standard Adapter
+
+=ModelCommitment= is the bridge. It takes three things:
+1. An =activations_model= (a =PytorchWrapper= around the PyTorch module)
+2. A list of =layers= (which layers to extract activations from)
+3. An optional =region_layer_map= (which layer maps to which brain region)
+
+#+begin_src python
+# brainscore_vision/model_helpers/brain_transformation/__init__.py
+
+class ModelCommitment(BrainModel):
+    def __init__(self, identifier, activations_model, layers,
+                 behavioral_readout_layer=None,
+                 region_layer_map=None,
+                 visual_degrees=8):
+        self.layers = layers
+        self.activations_model = activations_model
+        self._visual_degrees = visual_degrees
+
+        # Brain-region → model-layer mapping
+        if region_layer_map is None:
+            region_layer_map = self.load_region_layer_map_json(identifier)
+        if region_layer_map is None:
+            # No pre-committed map: run LayerSelection to find best layers
+            layer_selection = LayerSelection(
+                model_identifier=identifier,
+                activations_model=activations_model,
+                layers=layers,
+                visual_degrees=visual_degrees)
+            region_layer_map = RegionLayerMap(
+                layer_selection=layer_selection,
+                region_benchmarks=STANDARD_REGION_BENCHMARKS)
+
+        # Neural pathway: layer-mapped model with temporal alignment
+        layer_model = LayerMappedModel(
+            identifier=identifier,
+            activations_model=activations_model,
+            region_layer_map=region_layer_map)
+        self.layer_model = TemporalAligned(layer_model)
+
+        # Behavioral pathway: task-specific heads
+        logits_behavior = LabelBehavior(
+            identifier=identifier,
+            activations_model=activations_model)
+        behavioral_readout_layer = behavioral_readout_layer or layers[-1]
+        probabilities_behavior = ProbabilitiesMapping(
+            identifier=identifier,
+            activations_model=activations_model,
+            layer=behavioral_readout_layer)
+        odd_one_out = OddOneOut(
+            identifier=identifier,
+            activations_model=activations_model,
+            layer=behavioral_readout_layer)
+        self.behavior_model = BehaviorArbiter({
+            BrainModel.Task.label:         logits_behavior,
+            BrainModel.Task.probabilities: probabilities_behavior,
+            BrainModel.Task.odd_one_out:   odd_one_out,
+        })
+        self.do_behavior = False
+#+end_src
+
+* Two Pathways: Neural and Behavioral
+
+=ModelCommitment= handles two kinds of benchmarks:
+
+** Neural benchmarks (=start_recording= → =look_at=)
+
+When a benchmark calls =model.start_recording('IT', timebins)=, the model
+knows to extract activations from the layer committed to IT. Then =look_at=
+returns a =NeuroidAssembly=:
+
+#+begin_src python
+def start_recording(self, recording_target, time_bins):
+    return self.layer_model.start_recording(recording_target, time_bins)
+
+def look_at(self, stimuli, number_of_trials=1, require_variance=False):
+    if self.do_behavior:
+        return self.behavior_model.look_at(stimuli, ...)
+    else:
+        return self.layer_model.look_at(stimuli, ...)
+#+end_src
+
+** Behavioral benchmarks (=start_task= → =look_at=)
+
+When a benchmark calls =model.start_task(Task.probabilities, fitting_stimuli)=,
+the behavioral readout head is configured. Then =look_at= returns a
+=BehavioralAssembly=:
+
+#+begin_src python
+def start_task(self, task, *args, **kwargs):
+    if task != BrainModel.Task.passive:
+        self.behavior_model.start_task(task, *args, **kwargs)
+        self.do_behavior = True
+    else:
+        self.do_behavior = False
+#+end_src
+
+* The Layer-Region Mapping
+
+The central question: /which model layer corresponds to which brain region?/
+
+** Pre-committed mappings
+
+Many models ship a JSON file in =models/<plugin>/region_layer_map/<identifier>.json=:
+
+#+begin_src json
+{
+    "V1": "features.2",
+    "V2": "features.5",
+    "V4": "features.8",
+    "IT": "features.11"
+}
+#+end_src
+
+=ModelCommitment= checks for this file first via =load_region_layer_map_json()=.
+
+** Automatic layer selection
+
+If no JSON exists, =LayerSelection= runs a search: for each candidate layer,
+it scores that layer on a small benchmark for each brain region (V1, V2, V4, IT).
+The best-performing layer per region becomes the commitment:
+
+#+begin_src python
+STANDARD_REGION_BENCHMARKS = {
+    'V1': 'dicarlo.MajajHong2015public.V1-pls',
+    'V2': 'dicarlo.MajajHong2015public.V2-pls',
+    'V4': 'dicarlo.MajajHong2015public.V4-pls',
+    'IT': 'dicarlo.MajajHong2015public.IT-pls',
+}
+#+end_src
+
+This is computationally expensive (scores every layer × every region), which is
+why the results are cached in JSON for subsequent runs.
+
+* =PytorchWrapper=: Activation Extraction via Forward Hooks
+
+The =activations_model= passed to =ModelCommitment= is typically a =PytorchWrapper=.
+This class uses PyTorch's forward hook mechanism to capture intermediate layer
+outputs during a forward pass:
+
+#+begin_src python
+# brainscore_vision/model_helpers/activations/pytorch.py
+
+class PytorchWrapper:
+    def __init__(self, model, preprocessing, identifier=None,
+                 forward_kwargs=None):
+        self._device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+        self._model = model.to(self._device)
+        identifier = identifier or model.__class__.__name__
+        self._extractor = ActivationsExtractorHelper(
+            identifier=identifier,
+            preprocessing=preprocessing,
+            get_activations=self.get_activations)
+        self._extractor.insert_attrs(self)
+        self._forward_kwargs = forward_kwargs or {}
+
+    def get_activations(self, images, layer_names):
+        """Register hooks, run forward pass, collect activations."""
+        images = Variable(torch.stack([
+            torch.from_numpy(img) if not isinstance(img, torch.Tensor)
+            else img
+            for img in images
+        ])).to(self._device)
+
+        self._model.eval()
+        layer_results = OrderedDict()
+        hooks = []
+
+        for layer_name in layer_names:
+            layer = self.get_layer(layer_name)
+            hook = self.register_hook(
+                layer, layer_name, target_dict=layer_results)
+            hooks.append(hook)
+
+        with torch.no_grad():
+            self._model(images, **self._forward_kwargs)
+
+        for hook in hooks:
+            hook.remove()
+        return layer_results
+
+    def get_layer(self, layer_name):
+        """Navigate nested module hierarchy by splitting on '.'."""
+        module = self._model
+        for part in layer_name.split('.'):
+            module = module._modules.get(part)
+            assert module is not None
+        return module
+
+    def register_hook(self, layer, layer_name, target_dict):
+        def hook_function(_layer, _input, output, name=layer_name):
+            target_dict[name] = PytorchWrapper._tensor_to_numpy(output)
+        return layer.register_forward_hook(hook_function)
+#+end_src
+
+** How forward hooks work
+
+PyTorch's =register_forward_hook(fn)= attaches a callback to a module.
+After the module's =forward()= runs, the hook fires with the output tensor.
+Brain-Score uses this to capture activations from /any/ intermediate layer
+without modifying the model's code:
+
+#+begin_example
+                    Input Images
+                         │
+                ┌────────▼────────┐
+                │   features.0    │ ←── hook captures output → layer_results['features.0']
+                ├─────────────────┤
+                │   features.2    │ ←── hook captures output → layer_results['features.2']
+                ├─────────────────┤
+                │      ...        │
+                ├─────────────────┤
+                │  classifier.6   │ ←── hook captures output → layer_results['classifier.6']
+                └────────┬────────┘
+                         │
+                    Final output (discarded)
+#+end_example
+
+The hooks are /temporary/ — registered before the forward pass and removed
+immediately after. This ensures no side effects on the model.
+
+* =ActivationsExtractorHelper=: The Backbone
+
+=PytorchWrapper= delegates to =ActivationsExtractorHelper=, which handles:
+
+- *Batching*: splits large stimulus sets into GPU-friendly batches
+- *Caching*: =@store_xarray= decorator memoizes results by stimulus set hash
+- *Deduplication*: if the same image appears multiple times, it is processed
+  only once and then replicated
+- *Assembly packaging*: raw numpy arrays → =NeuroidAssembly= with proper
+  coordinates (=stimulus_path=, =neuroid_num=, =layer=, =channel=)
+
+The shape mapping:
+| Activation shape | Interpretation                          | Assembly dims                          |
+|------------------+-----------------------------------------+----------------------------------------|
+| =(batch,)=         | Fully connected (1D)                    | =presentation × neuroid=                |
+| =(batch, seq, d)=  | Transformer (2D) — averaged over tokens | =presentation × neuroid=                |
+| =(batch, c, h, w)= | Convolutional (3D)                      | =presentation × neuroid= (c×h×w flattened) |
+
+** Extensibility hooks
+
+#+begin_src python
+# Register a hook to reduce dimensionality after each batch
+handle = extractor.register_batch_activations_hook(
+    lambda batch_activations: {
+        layer: PCA(n_components=1000).fit_transform(acts)
+        for layer, acts in batch_activations.items()
+    })
+
+# Register a hook to transform stimuli before processing
+handle = extractor.register_stimulus_set_hook(
+    lambda stimulus_set: resize_stimulus_set(stimulus_set, 224))
+
+# Disable/enable/remove hooks
+handle.disable()
+handle.enable()
+handle.remove()
+#+end_src
+
+* Complete Data Flow
+
+#+begin_example
+benchmark.start_recording('IT', timebins)
+  │
+  └─► ModelCommitment.start_recording('IT', timebins)
+        └─► LayerMappedModel notes: region='IT' → layer='features.11'
+
+benchmark: model.look_at(stimulus_set)
+  │
+  └─► ModelCommitment.look_at(stimulus_set)
+        └─► LayerMappedModel.look_at(stimulus_set)
+              └─► PytorchWrapper.from_stimulus_set(stimulus_set, layers=['features.11'])
+                    └─► ActivationsExtractorHelper
+                          ├─ load_preprocess_images(paths, image_size=224)
+                          ├─ batch loop:
+                          │    └─ get_activations(batch, ['features.11'])
+                          │         ├─ register hook on features.11
+                          │         ├─ model.forward(batch)
+                          │         ├─ hook fires → captures numpy array
+                          │         └─ remove hook
+                          └─ package into NeuroidAssembly
+                               coords: stimulus_path, neuroid_num, layer, ...
+
+  Result: NeuroidAssembly(presentation=N_stimuli, neuroid=N_units)
+#+end_example
+
+* Hands-On: Building a Model from Scratch
+
+** Step 1: Wrap a PyTorch model
+
+#+begin_src python :results output
+import torch
+import torchvision.models as models
+from brainscore_vision.model_helpers.activations.pytorch import (
+    PytorchWrapper, load_preprocess_images)
+
+# Load a pretrained VGG-11
+pytorch_model = models.vgg11(pretrained=True)
+
+# Define preprocessing
+preprocessing = load_preprocess_images(image_size=224)
+
+# Wrap it
+wrapper = PytorchWrapper(
+    model=pytorch_model,
+    preprocessing=preprocessing,
+    identifier='my_vgg11')
+
+print(f"Wrapper identifier: {wrapper.identifier}")
+#+end_src
+
+** Step 2: List available layers
+
+#+begin_src python :results output
+# List all leaf layers (no children)
+for name, module in wrapper.layers():
+    print(f"  {name:30s} {module.__class__.__name__}")
+#+end_src
+
+Expected output (abbreviated):
+#+begin_example
+  features.0                     Conv2d
+  features.1                     ReLU
+  features.2                     MaxPool2d
+  features.3                     Conv2d
+  ...
+  classifier.0                   Linear
+  classifier.1                   ReLU
+  classifier.2                   Dropout
+  classifier.3                   Linear
+  classifier.4                   ReLU
+  classifier.5                   Dropout
+  classifier.6                   Linear
+#+end_example
+
+** Step 3: Extract activations from specific layers
+
+#+begin_src python :results output
+import numpy as np
+from PIL import Image
+
+# Create a dummy stimulus (224x224 RGB)
+img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
+img.save('/tmp/test_stimulus.png')
+
+# Extract activations from two layers
+activations = wrapper.get_activations(
+    images=[preprocessing('/tmp/test_stimulus.png')],
+    layer_names=['features.8', 'classifier.6'])
+
+for layer_name, acts in activations.items():
+    print(f"{layer_name}: shape={acts.shape}, dtype={acts.dtype}")
+#+end_src
+
+Expected output:
+#+begin_example
+features.8:   shape=(1, 256, 14, 14), dtype=float32
+classifier.6: shape=(1, 1000),         dtype=float32
+#+end_example
+
+** Step 4: Create a ModelCommitment
+
+#+begin_src python :results output
+from brainscore_vision.model_helpers.brain_transformation import ModelCommitment
+
+LAYERS = [
+    'features.0', 'features.3', 'features.6', 'features.8',
+    'features.11', 'features.13', 'features.16', 'features.18',
+    'classifier.0', 'classifier.3', 'classifier.6'
+]
+
+# With an explicit region-layer map (no LayerSelection search)
+model = ModelCommitment(
+    identifier='my_vgg11',
+    activations_model=wrapper,
+    layers=LAYERS,
+    region_layer_map={
+        'V1':  'features.3',
+        'V2':  'features.6',
+        'V4':  'features.11',
+        'IT':  'features.18',
+    })
+
+print(f"Model identifier: {model.identifier}")
+print(f"Visual degrees: {model.visual_degrees()}")
+#+end_src
+
+** Step 5: Use the BrainModel interface
+
+#+begin_src python :results output
+from brainscore_vision.model_interface import BrainModel
+
+# Tell the model to record from IT
+model.start_recording(
+    recording_target=BrainModel.RecordingTarget.IT,
+    time_bins=[(70, 170)])
+
+# Present stimuli — returns NeuroidAssembly
+# (In practice, you'd use a real StimulusSet here)
+# assembly = model.look_at(stimulus_set)
+# print(f"Response shape: {assembly.shape}")
+# print(f"Dimensions: {assembly.dims}")
+#+end_src
+
+* The Adapter Pattern in Context
+
+#+begin_example
+┌─────────────────────────┐      ┌─────────────────────────┐
+│     PyTorch World        │      │    Neuroscience World    │
+│                         │      │                         │
+│  nn.Module              │      │  BrainModel             │
+│  .forward(tensor)       │      │  .look_at(stimuli)      │
+│  → tensor               │      │  → NeuroidAssembly      │
+│                         │      │                         │
+│  Named modules          │      │  Brain regions          │
+│  ('features.11')        │      │  ('IT')                 │
+│                         │      │                         │
+│  Forward hooks          │      │  Recording targets      │
+│  → intermediate tensors │      │  → neural responses     │
+└───────────┬─────────────┘      └───────────▲─────────────┘
+            │                                │
+            │  ┌─────────────────────────┐   │
+            └──┤   ModelCommitment       ├───┘
+               │                         │
+               │  PytorchWrapper         │
+               │  ActivationsExtractor   │
+               │  LayerMappedModel       │
+               │  region_layer_map       │
+               │  BehaviorArbiter        │
+               └─────────────────────────┘
+#+end_example
+
+This is the same Adapter Pattern used in DMT, where =ModelAdapter= bridges
+a biophysical simulator (NEURON/CoreNEURON) to a validation interface. The
+abstraction level differs — functional activations vs. biophysical
+simulations — but the engineering pattern is identical.
+
+* Summary
+
+| Concept                  | What it is                                                    |
+|--------------------------+---------------------------------------------------------------|
+| =BrainModel=               | Interface: =look_at()=, =start_recording()=, =start_task()=        |
+| =ModelCommitment=           | Standard adapter: PyTorch → BrainModel                        |
+| =PytorchWrapper=            | Forward hooks for activation extraction                       |
+| =ActivationsExtractorHelper= | Batching, caching, deduplication, assembly packaging          |
+| =LayerMappedModel=          | Routes brain regions to model layers via =region_layer_map=     |
+| =BehaviorArbiter=           | Routes task types to behavioral readout heads                 |
+| =LayerSelection=            | Automatic search for best layer per brain region              |
+| Forward hooks            | PyTorch mechanism: callback on module output, no code changes |
+
+* Next
+
+- [[file:01-installation-and-first-score.org][Tutorial 01]]: Installation and first score
+- [[file:02-plugin-architecture.org][Tutorial 02]]: Plugin system and registry architecture
+- [[file:04-benchmarks-metrics-ceilings.org][Tutorial 04]]: How benchmarks compose data, metrics, and ceilings
+- [[file:05-score-and-data-assembly.org][Tutorial 05]]: The Score and DataAssembly xarray conventions

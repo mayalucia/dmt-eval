@@ -1,0 +1,298 @@
+#+TITLE: WP-05 — Plugin Base Classes: Auto-Registration via =__init_subclass__=
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+PROPERTY: header-args :tangle ../plugin.py
+#+OPTIONS: toc:2 num:t H:3
+
+* Introduction
+
+This module is the user-facing API of the package. A plugin author writes:
+
+#+begin_example python
+class AlexNetPlugin(ModelPlugin, identifier='alexnet'):
+    @classmethod
+    def build(cls):
+        return ModelCommitment(
+            identifier='alexnet',
+            activations_model=get_model('alexnet'),
+            layers=get_layers('alexnet'))
+#+end_example
+
+And the model is registered. No dict assignment, no text search, no separate
+registration call. The subclass declaration /is/ the registration.
+
+Compare to Brain-Score's current pattern:
+
+#+begin_example python
+# brainscore_vision/models/alexnet/__init__.py
+from brainscore_vision import model_registry
+model_registry['alexnet'] = lambda: ModelCommitment(
+    identifier='alexnet',
+    activations_model=get_model('alexnet'),
+    layers=get_layers('alexnet'))
+#+end_example
+
+Brain-Score then discovers this by text-searching =__init__.py= files for the
+literal string =model_registry['alexnet']=. The plugin loader
+(=ImportPlugin.locate_plugin()=) opens each =__init__.py=, applies a regex, and
+imports matching modules.
+
+The text-search approach has known failure modes:
+
+- Rename =model_registry= to =registry= → the scanner misses the plugin
+- Multi-line registration → the regex may not match
+- Conditional registration (=if FEATURE_FLAG: model_registry[...]=) → invisible
+  to the scanner
+- No validation at discovery time → broken plugins enter the registry silently
+
+The =__init_subclass__= approach replaces all of this with Python's own class
+machinery. When Python encounters =class AlexNetPlugin(ModelPlugin,
+identifier='alexnet')=, it calls =ModelPlugin.__init_subclass__= with
+=identifier='alexnet'=. We use this to register =cls.build= in the global
+=model_registry=.
+
+* Source
+
+#+begin_src python
+"""
+Plugin base classes with auto-registration via __init_subclass__.
+
+Brain-Score discovers plugins by text-searching __init__.py files for
+literal strings like model_registry['alexnet']. This replaces that
+with Python's own class machinery: subclass ModelPlugin with an
+identifier= argument and you're registered.
+
+The old way (Brain-Score):
+    model_registry['alexnet'] = lambda: ModelCommitment(...)
+
+The new way:
+    class AlexNetPlugin(ModelPlugin, identifier='alexnet'):
+        @classmethod
+        def build(cls):
+            return ModelCommitment(...)
+
+Both produce a factory in the registry. The new way additionally:
+- Is discoverable by normal Python import (no text search)
+- Can validate that build() exists at class definition time
+- Can validate the build output at test time
+"""
+
+from __future__ import annotations
+
+from .registry import PluginRegistry
+from .brain_model import BrainModelInterface, BenchmarkInterface
+
+
+# Module-level registries — the equivalents of Brain-Score's globals.
+model_registry = PluginRegistry('model', BrainModelInterface)
+benchmark_registry = PluginRegistry('benchmark', BenchmarkInterface)
+metric_registry = PluginRegistry('metric')
+data_registry = PluginRegistry('data')
+stimulus_set_registry = PluginRegistry('stimulus_set')
+
+
+class ModelPlugin:
+    """Base class for model plugins. Subclassing auto-registers.
+
+    Usage::
+
+        class AlexNetPlugin(ModelPlugin, identifier='alexnet'):
+            @classmethod
+            def build(cls):
+                from .model import get_model, get_layers
+                return ModelCommitment(
+                    identifier='alexnet',
+                    activations_model=get_model('alexnet'),
+                    layers=get_layers('alexnet'))
+
+    The class is registered in model_registry at definition time.
+    build() is called lazily when the model is actually loaded.
+    """
+
+    def __init_subclass__(cls, identifier: str = None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if identifier is not None:
+            # Check that the subclass defines its OWN build(), not just
+            # inherits the base class placeholder.
+            if 'build' not in vars(cls):
+                raise TypeError(
+                    f"{cls.__name__} must override build() classmethod"
+                )
+            model_registry[identifier] = cls.build
+            cls._identifier = identifier
+
+    @classmethod
+    def build(cls):
+        """Override this to construct and return a BrainModel."""
+        raise NotImplementedError(
+            f"{cls.__name__}.build() not implemented"
+        )
+
+
+class BenchmarkPlugin:
+    """Base class for benchmark plugins.
+
+    Usage::
+
+        class MajajHong2015ITPlugin(BenchmarkPlugin,
+                                     identifier='dicarlo.MajajHong2015public.IT-pls'):
+            @classmethod
+            def build(cls):
+                return NeuralBenchmark(...)
+    """
+
+    def __init_subclass__(cls, identifier: str = None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if identifier is not None:
+            if 'build' not in vars(cls):
+                raise TypeError(
+                    f"{cls.__name__} must override build() classmethod"
+                )
+            benchmark_registry[identifier] = cls.build
+            cls._identifier = identifier
+
+    @classmethod
+    def build(cls):
+        """Override this to construct and return a Benchmark."""
+        raise NotImplementedError(
+            f"{cls.__name__}.build() not implemented"
+        )
+
+
+class MetricPlugin:
+    """Base class for metric plugins."""
+
+    def __init_subclass__(cls, identifier: str = None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if identifier is not None:
+            if 'build' not in vars(cls):
+                raise TypeError(
+                    f"{cls.__name__} must override build() classmethod"
+                )
+            metric_registry[identifier] = cls.build
+            cls._identifier = identifier
+
+    @classmethod
+    def build(cls):
+        """Override this to construct and return a Metric."""
+        raise NotImplementedError(
+            f"{cls.__name__}.build() not implemented"
+        )
+
+
+class DataPlugin:
+    """Base class for data assembly plugins."""
+
+    def __init_subclass__(cls, identifier: str = None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if identifier is not None:
+            if 'build' not in vars(cls):
+                raise TypeError(
+                    f"{cls.__name__} must override build() classmethod"
+                )
+            data_registry[identifier] = cls.build
+            cls._identifier = identifier
+
+    @classmethod
+    def build(cls):
+        raise NotImplementedError(
+            f"{cls.__name__}.build() not implemented"
+        )
+#+end_src
+
+* Commentary
+
+** Five Global Registries
+
+The module creates five =PluginRegistry= instances, mirroring Brain-Score's
+global registries:
+
+| Registry                  | Interface               | Brain-Score Equivalent                   |
+|---------------------------+-------------------------+------------------------------------------|
+| =model_registry=            | =BrainModelInterface=     | =brainscore_vision.model_registry=         |
+| =benchmark_registry=        | =BenchmarkInterface=      | =brainscore_vision.benchmark_registry=     |
+| =metric_registry=           | (none)                  | =brainscore_vision.metric_registry=        |
+| =data_registry=             | (none)                  | =brainscore_vision.data_registry=          |
+| =stimulus_set_registry=     | (none)                  | =brainscore_vision.stimulus_set_registry=  |
+
+Only =model_registry= and =benchmark_registry= are bound to interfaces. The
+others are unvalidated — metrics, data assemblies, and stimulus sets don't have
+formal interface declarations in Brain-Score's current codebase. Adding
+interface validation to them would be a future enhancement.
+
+** The =__init_subclass__= Pattern
+
+Each plugin base class follows the same pattern:
+
+#+begin_example python
+def __init_subclass__(cls, identifier: str = None, **kwargs):
+    super().__init_subclass__(**kwargs)
+    if identifier is not None:
+        if 'build' not in vars(cls):
+            raise TypeError(...)
+        some_registry[identifier] = cls.build
+        cls._identifier = identifier
+#+end_example
+
+Three design choices:
+
+1. *=identifier= defaults to =None=.* This allows abstract intermediate
+   subclasses that don't register:
+
+   #+begin_example python
+   class VisionModelPlugin(ModelPlugin):     # no identifier → not registered
+       """Common base for vision model plugins."""
+       ...
+
+   class AlexNetPlugin(VisionModelPlugin, identifier='alexnet'):  # registered
+       ...
+   #+end_example
+
+2. *=vars(cls)= check for =build=.* We check ='build' in vars(cls)=, not
+   =hasattr(cls, 'build')=. The difference: =hasattr= would find the inherited
+   =build()= from =ModelPlugin= itself (which raises =NotImplementedError=).
+   =vars(cls)= only finds methods defined in /this/ class's body. This prevents
+   registering a subclass that forgot to override =build()=.
+
+3. *=cls._identifier= stored.* The identifier is saved on the class for
+   introspection. This is metadata — it doesn't affect the registry behavior.
+
+** Lazy Loading
+
+=model_registry[identifier] = cls.build= stores the /classmethod/, not its
+result. The model is only constructed when =model_registry.load('alexnet')=
+is called, which invokes =cls.build()=.
+
+This is important: model construction can be expensive (downloading weights,
+allocating GPU memory). The registry should be cheap to populate — import the
+module, define the class, move on. Construction happens only when a benchmark
+actually requests the model.
+
+** Repetition in Plugin Classes
+
+=ModelPlugin=, =BenchmarkPlugin=, =MetricPlugin=, and =DataPlugin= have nearly
+identical =__init_subclass__= methods. The only difference is which registry
+each one writes to.
+
+One could factor this into a parameterized base class:
+
+#+begin_example python
+def make_plugin_base(registry):
+    class PluginBase:
+        def __init_subclass__(cls, identifier=None, **kwargs):
+            ...
+            registry[identifier] = cls.build
+    return PluginBase
+
+ModelPlugin = make_plugin_base(model_registry)
+#+end_example
+
+We don't, because explicit is better than implicit. Each plugin class has a
+clear docstring, a clear error message, and a clear connection to its registry.
+The repetition is three lines per class. The clarity is worth it.
+
+* Cross-References
+
+- [[file:03-registry.org][WP-03: PluginRegistry]] — the registry objects populated by these classes
+- [[file:02-brain-model.org][WP-02: Brain Model]] — =BrainModelInterface= and =BenchmarkInterface= used for validation
+- [[file:06-compat.org][WP-06: Compat]] — syncs these registries with Brain-Score's existing dicts

@@ -1,0 +1,250 @@
+#+title: Brain-Score Tutorial 01 — Installation and First Score
+#+author: Vishal Sood
+#+date: <2026-02-27 Fri>
+#+options: toc:t num:t
+
+* What This Tutorial Covers
+
+Install =brainscore-vision=, run a public benchmark against a built-in model, and understand what the output means. By the end you will have a working Brain-Score environment and a concrete score to inspect.
+
+* Prerequisites
+
+- Python >= 3.11
+- pip >= 18.1
+- A virtual environment (recommended)
+- ~2 GB disk for cached data and model weights
+
+* Installation
+
+** Create a virtual environment
+
+#+begin_src sh
+python -m venv .venv-brainscore
+source .venv-brainscore/bin/activate
+#+end_src
+
+** Install from GitHub (development version)
+
+The PyPI package exists (=brainscore-vision=), but for tutorial purposes
+we install from source to have access to the full codebase:
+
+#+begin_src sh
+pip install git+https://github.com/brain-score/vision
+#+end_src
+
+This pulls in =brainscore-core=, =brainio=, =result-caching=, and all
+core dependencies (PyTorch, xarray, netCDF4, etc.).
+
+** Troubleshooting: netCDF4
+
+If pip fails on =netcdf4=, use conda instead:
+
+#+begin_src sh
+conda install netcdf4
+#+end_src
+
+** Configuration: cache directory
+
+Brain-Score caches benchmark ceilings and results. Set the cache location:
+
+#+begin_src sh
+export RESULTCACHING_HOME=~/.brainscore_cache
+#+end_src
+
+Default is =~/.result_caching=.
+
+* The Core API: =brainscore_vision.score()=
+
+The entire platform reduces to one function call:
+
+#+begin_src python
+import brainscore_vision
+
+score = brainscore_vision.score(
+    model_identifier='alexnet',
+    benchmark_identifier='dicarlo.MajajHong2015public.IT-pls'
+)
+#+end_src
+
+This does four things:
+1. Loads the model (=alexnet=) from the model registry
+2. Loads the benchmark (=MajajHong2015public.IT-pls=) from the benchmark registry
+3. Runs the benchmark: presents stimuli to the model, extracts activations, compares to neural recordings using a metric
+4. Returns a =Score= (normalized 0-1)
+
+* Your First Score
+
+** Run the scoring
+
+#+begin_src python :results output
+import brainscore_vision
+
+# Score AlexNet on macaque IT neural predictivity
+# First run downloads data (~minutes); subsequent runs use cache
+score = brainscore_vision.score(
+    model_identifier='alexnet',
+    benchmark_identifier='dicarlo.MajajHong2015public.IT-pls'
+)
+
+print(f"Score: {score}")
+print(f"Score center: {float(score):.4f}")
+print(f"Score error: {float(score.sel(aggregation='error')):.4f}")
+print(f"Score ceiling: {float(score.ceiling):.4f}")
+#+end_src
+
+Expected output (approximate):
+#+begin_example
+Score center: 0.5880
+Score error: 0.0068
+Score ceiling: 0.8170
+#+end_example
+
+** Interpret the score
+
+The score is *ceiling-normalized*: if the raw correlation between model predictions and neural data is 0.48, and the data ceiling (internal consistency of the neural recordings) is 0.82, then:
+
+#+begin_example
+normalized_score = raw_correlation / ceiling = 0.48 / 0.82 ≈ 0.59
+#+end_example
+
+A score of 1.0 means the model predicts neural responses as well as the data predicts itself (i.e., at ceiling). A score of 0.0 means no predictive power.
+
+** Inspect the Score object
+
+The =Score= is an extended =xarray.DataArray= with metadata:
+
+#+begin_src python :results output
+# The Score object
+print(type(score))
+# => <class 'brainscore_core.metrics.Score'>
+
+# Coordinates
+print(score.coords)
+# Includes 'aggregation' dimension with 'center' and 'error'
+
+# Raw sub-scores (before aggregation)
+if hasattr(score, 'raw'):
+    raw = score.raw
+    print(f"Raw shape: {raw.shape}")
+    print(f"Raw values (first 5): {raw.values[:5]}")
+
+# Metadata attached by the scoring pipeline
+print(f"Model: {score.attrs.get('model_identifier', 'N/A')}")
+print(f"Benchmark: {score.attrs.get('benchmark_identifier', 'N/A')}")
+#+end_src
+
+* What Just Happened: The Scoring Pipeline
+
+Let's trace what =brainscore_vision.score()= does internally:
+
+#+begin_example
+score('alexnet', 'MajajHong2015public.IT-pls')
+  │
+  ├─ load_model('alexnet')
+  │    └─ import_plugin('models', 'alexnet')
+  │         └─ models/alexnet/__init__.py
+  │              └─ ModelCommitment(activations_model=PytorchWrapper(...), layers=LAYERS)
+  │
+  ├─ load_benchmark('MajajHong2015public.IT-pls')
+  │    └─ import_plugin('benchmarks', 'MajajHong2015public.IT-pls')
+  │         └─ benchmarks/majajhong2015/__init__.py
+  │              └─ NeuralBenchmark(assembly=..., metric=pls_regression, ceiling=...)
+  │
+  └─ benchmark(model)
+       ├─ model.start_recording(recording_target='IT', time_bins=...)
+       ├─ model.look_at(stimuli)  →  NeuroidAssembly
+       ├─ metric(model_assembly, neural_assembly)  →  raw_score
+       └─ raw_score / ceiling  →  normalized Score
+#+end_example
+
+Key concepts:
+- *Model*: wraps a PyTorch model (AlexNet) with the =BrainModel= interface
+- *Benchmark*: composes data (neural recordings) + metric (PLS regression) + ceiling
+- *Score*: the final output, normalized to [0, 1]
+
+* Alternative: Using the Public Benchmark Pool
+
+For quick exploration, use the pre-loaded public benchmark pool:
+
+#+begin_src python :results output
+from brainscore_vision.benchmarks import public_benchmark_pool
+
+# List available public benchmarks
+print("Available public benchmarks:")
+for name in sorted(public_benchmark_pool.keys()):
+    print(f"  {name}")
+#+end_src
+
+Then score directly:
+
+#+begin_src python :results output
+from brainscore_vision.benchmarks import public_benchmark_pool
+
+benchmark = public_benchmark_pool['dicarlo.MajajHong2015public.IT-pls']
+model = brainscore_vision.load_model('alexnet')
+score = benchmark(model)
+print(f"Score: {float(score):.4f}")
+#+end_src
+
+* Try Different Models
+
+The model registry contains 40+ models. Try a few:
+
+#+begin_src python :results output
+import brainscore_vision
+
+models_to_try = ['alexnet', 'resnet-18', 'resnet-50']
+benchmark_id = 'dicarlo.MajajHong2015public.IT-pls'
+
+for model_id in models_to_try:
+    try:
+        score = brainscore_vision.score(
+            model_identifier=model_id,
+            benchmark_identifier=benchmark_id
+        )
+        print(f"{model_id:>15s}: {float(score):.4f}")
+    except Exception as e:
+        print(f"{model_id:>15s}: ERROR - {e}")
+#+end_src
+
+* Try Different Benchmarks
+
+Score the same model on different brain regions:
+
+#+begin_src python :results output
+import brainscore_vision
+
+benchmarks_to_try = [
+    'dicarlo.MajajHong2015public.V4-pls',   # V4 neural predictivity
+    'dicarlo.MajajHong2015public.IT-pls',   # IT neural predictivity
+    'dicarlo.Rajalingham2018public-i2n',     # Behavioral (image-to-name)
+]
+
+for bench_id in benchmarks_to_try:
+    try:
+        score = brainscore_vision.score(
+            model_identifier='alexnet',
+            benchmark_identifier=bench_id
+        )
+        print(f"{bench_id:>50s}: {float(score):.4f}")
+    except Exception as e:
+        print(f"{bench_id:>50s}: ERROR - {e}")
+#+end_src
+
+* Summary
+
+| Concept                      | What it is                                          |
+|------------------------------+-----------------------------------------------------|
+| =brainscore_vision.score()=    | Top-level API: model + benchmark → normalized score |
+| =model_identifier=             | String key into the model registry (e.g., 'alexnet') |
+| =benchmark_identifier=         | String key into the benchmark registry              |
+| =Score=                        | Extended xarray.DataArray with center, error, raw   |
+| Ceiling normalization        | raw_correlation / data_ceiling → [0, 1]             |
+| =RESULTCACHING_HOME=           | Where cached results are stored                     |
+
+* Next
+
+- [[file:02-plugin-architecture.org][Tutorial 02]]: How the plugin system and registry work
+- [[file:03-model-commitment.org][Tutorial 03]]: How PyTorch models become BrainModels (the Adapter Pattern)
+- [[file:04-benchmarks-metrics-ceilings.org][Tutorial 04]]: How benchmarks compose data, metrics, and ceilings
+- [[file:05-score-and-data-assembly.org][Tutorial 05]]: The Score and DataAssembly xarray conventions

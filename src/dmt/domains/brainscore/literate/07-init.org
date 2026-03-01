@@ -1,0 +1,163 @@
+#+TITLE: WP-07 — =__init__.py=: Public API Surface
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+PROPERTY: header-args :tangle ../__init__.py
+#+OPTIONS: toc:2 num:t H:3
+
+* Introduction
+
+The =__init__.py= defines what you get when you write =from brain_score_dmt import
+...=. It is the public contract of the package — the set of names that users
+should depend on.
+
+The design follows a single rule: /import from =brain_score_dmt=, not from
+submodules/. A user should never need to write =from brain_score_dmt.interface
+import Interface= — the package re-exports everything worth using.
+
+* Source
+
+#+begin_src python
+"""
+brain-score-dmt: DMT-style plugin infrastructure for Brain-Score.
+
+A lightweight metaprogramming layer inspired by DMT (Digital Model Testing,
+Blue Brain Project), designed to wrap over Brain-Score's existing plugin
+system with proper interface enforcement, validated registration, and
+Python-native discovery.
+
+Key improvements over Brain-Score's current system:
+- Interface enforcement: BrainModelInterface validates at registration, not runtime
+- Validated registration: @implements and PluginRegistry.register() check compliance
+- Auto-discovery: __init_subclass__ replaces text search on __init__.py files
+- Bug fixes over DMT: per-interface registries, report ALL missing methods
+
+Key improvements over DMT's metaclass approach:
+- __init_subclass__ instead of InterfaceMeta: no MRO conflicts
+- No compound metaclass (AIMeta): simpler, no ClassAttributeMeta dependency
+- No runtime proxy synthesis (adapted()): unnecessary for Brain-Score's API
+- No Field descriptors: Brain-Score uses xarray for data validation
+
+Usage::
+
+    from brain_score_dmt import (
+        Interface,
+        PluginRegistry,
+        ModelPlugin,
+        BenchmarkPlugin,
+        BrainModelInterface,
+        BenchmarkInterface,
+        adapts,
+        implements,
+    )
+
+    # Define a model plugin (auto-registers)
+    class MyModel(ModelPlugin, identifier='my_model'):
+        @classmethod
+        def build(cls):
+            return ModelCommitment(...)
+
+    # Use the registry
+    from brain_score_dmt.plugin import model_registry
+    model = model_registry.load('my_model')
+
+    # Bridge to Brain-Score
+    from brain_score_dmt.compat import sync_to_brainscore
+    from brainscore_vision import model_registry as bs_registry
+    sync_to_brainscore(model_registry, bs_registry)
+"""
+
+from .interface import Interface
+from .registry import PluginRegistry
+from .adapter import adapts, implements
+from .brain_model import BrainModelInterface, BenchmarkInterface, MetricInterface
+from .plugin import (
+    ModelPlugin,
+    BenchmarkPlugin,
+    MetricPlugin,
+    DataPlugin,
+    model_registry,
+    benchmark_registry,
+    metric_registry,
+    data_registry,
+    stimulus_set_registry,
+)
+
+__all__ = [
+    # Core
+    'Interface',
+    'PluginRegistry',
+    # Decorators
+    'adapts',
+    'implements',
+    # Brain-Score interfaces
+    'BrainModelInterface',
+    'BenchmarkInterface',
+    'MetricInterface',
+    # Plugin base classes
+    'ModelPlugin',
+    'BenchmarkPlugin',
+    'MetricPlugin',
+    'DataPlugin',
+    # Registries
+    'model_registry',
+    'benchmark_registry',
+    'metric_registry',
+    'data_registry',
+    'stimulus_set_registry',
+]
+#+end_src
+
+* Commentary
+
+** What's Exported
+
+The =__all__= list groups exports into four categories:
+
+| Category           | Names                                                       |
+|--------------------+-------------------------------------------------------------|
+| Core               | =Interface=, =PluginRegistry=                                   |
+| Decorators         | =@adapts=, =@implements=                                       |
+| Brain-Score interfaces | =BrainModelInterface=, =BenchmarkInterface=, =MetricInterface= |
+| Plugin base classes | =ModelPlugin=, =BenchmarkPlugin=, =MetricPlugin=, =DataPlugin=   |
+| Registries         | =model_registry=, =benchmark_registry=, ...                    |
+
+** What's /Not/ Exported
+
+The compatibility bridge (=compat.py=) is imported from its submodule:
+
+#+begin_example python
+from brain_score_dmt.compat import sync_to_brainscore, audit_registry
+#+end_example
+
+This is deliberate. The compat functions are /operational/ (syncing, auditing)
+rather than /definitional/ (building plugins). They're used in setup scripts and
+CI jobs, not in plugin definitions. Keeping them out of the top-level import
+reduces namespace clutter and makes the "build a plugin" API cleaner.
+
+Similarly, the introspection helpers =get_adapted_models()= and
+=get_implemented_interfaces()= from =adapter.py= are not re-exported. They're
+utilities for framework internals, not for plugin authors.
+
+** Import Order
+
+The imports are ordered by dependency layer:
+
+1. =interface= (Layer 0) — no internal deps
+2. =registry= (Layer 1) — depends on =interface=
+3. =adapter= (Layer 1) — depends on =interface=
+4. =brain_model= (Layer 0) — depends on =interface=
+5. =plugin= (Layer 2) — depends on =registry=, =brain_model=
+
+This matches the reading order in the literate files.
+
+* Cross-References
+
+This is the final module. The full reading order:
+
+1. [[file:01-interface.org][WP-01: Interface]] — the foundation
+2. [[file:02-brain-model.org][WP-02: Brain Model]] — the domain contracts
+3. [[file:03-registry.org][WP-03: Registry]] — the validated dict
+4. [[file:04-adapter.org][WP-04: Adapter]] — the decorator API
+5. [[file:05-plugin.org][WP-05: Plugin]] — the user-facing base classes
+6. [[file:06-compat.org][WP-06: Compat]] — the migration bridge
+7. [[file:07-init.org][WP-07: Init]] — the public surface (this file)

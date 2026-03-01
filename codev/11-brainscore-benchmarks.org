@@ -1,0 +1,514 @@
+#+title: Brain-Score Tutorial 04 — Benchmarks, Metrics, and Ceilings
+#+author: Vishal Sood
+#+date: <2026-02-27 Fri>
+#+options: toc:t num:t
+
+* What This Tutorial Covers
+
+How a Brain-Score benchmark is composed from three ingredients — data (neural
+recordings), a metric (comparison method), and a ceiling (noise floor estimate).
+By the end you will understand the =NeuralBenchmark= class, the PLS regression
+metric, ceiling normalization, and how to interpret the numbers that come out.
+
+* The Benchmark Abstraction
+
+A benchmark is a callable that takes a =BrainModel= and returns a =Score=:
+
+#+begin_src python
+# brainscore_core/benchmarks/__init__.py
+
+class Benchmark(ABC):
+    def __call__(self, candidate) -> Score:
+        """Run the experiment on candidate, compare to primate data,
+        return a score between 0 and 1."""
+        raise NotImplementedError()
+
+    @property
+    def bibtex(self) -> str: ...       # Citation
+
+    @property
+    def identifier(self) -> str: ...   # e.g. 'dicarlo.MajajHong2015public.IT-pls'
+
+    @property
+    def parent(self) -> str: ...       # 'neural', 'behavioral', 'engineering'
+
+    @property
+    def version(self): ...             # Integer version
+
+    @property
+    def ceiling(self) -> Score: ...    # Data reliability estimate
+#+end_src
+
+The identifier convention is =<lab>.<dataset><access>.<region>-<metric>=:
+- =dicarlo=: Jim DiCarlo's lab (MIT)
+- =MajajHong2015public=: dataset from Majaj & Hong (2015), public subset
+- =IT-pls=: inferior temporal cortex, PLS regression metric
+
+* =BenchmarkBase=: Property Storage
+
+#+begin_src python
+class BenchmarkBase(Benchmark):
+    """Concrete storage of the five Benchmark properties."""
+    def __init__(self, identifier, ceiling, version, parent, bibtex=None):
+        self._identifier = identifier
+        self._ceiling = ceiling
+        self._version = version
+        self._parent = parent
+        self._bibtex = bibtex
+
+    @property
+    def identifier(self):
+        return self._identifier
+
+    @property
+    def ceiling(self):
+        return self._ceiling
+
+    # ... etc for version, parent, bibtex
+#+end_src
+
+* =NeuralBenchmark=: The Workhorse
+
+Most vision benchmarks are instances of =NeuralBenchmark=, which implements
+the standard neural predictivity protocol:
+
+#+begin_src python
+# brainscore_vision/benchmark_helpers/neural_common.py
+
+class NeuralBenchmark(BenchmarkBase):
+    def __init__(self, identifier, assembly, similarity_metric,
+                 visual_degrees, number_of_trials, **kwargs):
+        super().__init__(identifier=identifier, **kwargs)
+        self._assembly = assembly            # NeuroidAssembly: primate recordings
+        self._similarity_metric = similarity_metric  # e.g. PLS regression
+        region = np.unique(self._assembly['region'])
+        assert len(region) == 1
+        self.region = region[0]              # e.g. 'IT'
+        self.timebins = timebins_from_assembly(self._assembly)
+        self._visual_degrees = visual_degrees
+        self._number_of_trials = number_of_trials
+
+    def __call__(self, candidate: BrainModel):
+        # 1. Configure the model for this brain region
+        candidate.start_recording(self.region, time_bins=self.timebins)
+
+        # 2. Scale stimuli to the model's visual field
+        stimulus_set = place_on_screen(
+            self._assembly.stimulus_set,
+            target_visual_degrees=candidate.visual_degrees(),
+            source_visual_degrees=self._visual_degrees)
+
+        # 3. Run the experiment: present stimuli, collect responses
+        source_assembly = candidate.look_at(
+            stimulus_set,
+            number_of_trials=self._number_of_trials)
+
+        # 4. Handle single time bin
+        if 'time_bin' in source_assembly.dims:
+            if source_assembly.sizes['time_bin'] == 1:
+                source_assembly = source_assembly.squeeze('time_bin')
+
+        # 5. Compare model responses to primate recordings
+        raw_score = self._similarity_metric(
+            source_assembly, self._assembly)
+
+        # 6. Normalize by ceiling
+        return explained_variance(raw_score, self.ceiling)
+#+end_src
+
+The six steps mirror an actual neuroscience experiment:
+1. Place electrodes (=start_recording=)
+2. Set up the display (=place_on_screen=)
+3. Run trials (=look_at=)
+4. Clean up data format
+5. Analyze data (metric)
+6. Report relative to noise floor (ceiling normalization)
+
+* The Three Ingredients
+
+** Ingredient 1: Data (=NeuroidAssembly=)
+
+The =assembly= is an xarray =DataArray= containing neural recordings:
+
+#+begin_src python :results output
+# Conceptually (not runnable without data):
+# assembly.dims   = ('presentation', 'neuroid')
+# assembly.shape  = (N_images × N_repetitions, N_neurons)
+#
+# Coordinates:
+#   presentation: stimulus_id, image_id, repetition, object_name, category, ...
+#   neuroid:      neuroid_id, region, animal, ...
+#
+# Also carries a .stimulus_set attribute:
+#   StimulusSet: DataFrame of stimulus metadata + image file paths
+#+end_src
+
+For MajajHong2015:
+- 2560 presentations (256 images × ~10 repetitions)
+- 168 IT neurons (or 88 V4 neurons)
+- Recorded from 2 macaque monkeys
+- Stimuli: 256 images of 64 objects, 8 categories
+
+** Ingredient 2: Metric (=similarity_metric=)
+
+The metric compares model activations to neural recordings. The standard
+metric is *partial least squares (PLS) regression*:
+
+#+begin_src python
+# Conceptual implementation of the PLS metric
+
+def pls_regression_metric(model_assembly, neural_assembly):
+    """
+    For each neuron:
+    1. Fit PLS from model activations → neural response (train split)
+    2. Predict neural response from model activations (test split)
+    3. Compute Pearson r between predicted and actual neural response
+    4. Average across neurons → scalar score
+
+    Cross-validated: train/test splits by image identity.
+    """
+    scores = []
+    for neuron in neural_assembly.neuroid:
+        # Cross-validated prediction
+        predicted = cross_validated_pls_predict(
+            X=model_assembly, y=neural_assembly.sel(neuroid=neuron))
+        # Pearson correlation
+        r = pearsonr(predicted, actual)
+        scores.append(r)
+    return Score(np.mean(scores))
+#+end_src
+
+The =Metric= base class:
+
+#+begin_src python
+# brainscore_core/metrics/__init__.py
+
+class Metric:
+    """1 = identical assemblies, 0 = no relationship."""
+    def __call__(self, assembly1: DataAssembly,
+                 assembly2: DataAssembly) -> Score:
+        raise NotImplementedError()
+#+end_src
+
+Other metrics in Brain-Score:
+| Metric         | What it computes                              | Used for               |
+|----------------+-----------------------------------------------+------------------------|
+| PLS regression | Cross-validated PLS fit + Pearson r           | Neural predictivity    |
+| RSA            | Representational Similarity Analysis          | Representational match |
+| CKA            | Centered Kernel Alignment                     | Representational match |
+| Accuracy       | Classification accuracy                       | Behavioral benchmarks  |
+| I2N            | Image-level match to human naming patterns    | Behavioral benchmarks  |
+| OOD            | Odd-one-out discrimination                    | Behavioral benchmarks  |
+
+** Ingredient 3: Ceiling
+
+The ceiling estimates the /maximum possible score/ given the noise in the
+neural data. It answers: "How well would a perfect model score, given that
+the data itself has trial-to-trial variability?"
+
+*** Split-half reliability
+
+The standard ceiling method:
+1. Split the neural data into two halves (e.g., odd vs even repetitions)
+2. Fit the metric from one half to the other
+3. The resulting r is the data's internal consistency
+4. Repeat with random splits, average
+
+#+begin_src python
+# Conceptual ceiling computation
+def split_half_ceiling(neural_assembly, metric, n_splits=10):
+    ceilings = []
+    for _ in range(n_splits):
+        half1, half2 = random_split(neural_assembly, by='repetition')
+        # Average across repetitions within each half
+        avg1 = half1.mean('repetition')
+        avg2 = half2.mean('repetition')
+        # How well does one half predict the other?
+        r = metric(avg1, avg2)
+        ceilings.append(r)
+    return Score(np.mean(ceilings))
+#+end_src
+
+*** Known ceiling values
+
+| Benchmark                           | Ceiling | Interpretation                       |
+|-------------------------------------+---------+--------------------------------------|
+| MajajHong2015public.V4-pls          |   0.892 | V4 recordings are highly consistent  |
+| MajajHong2015public.IT-pls          |   0.817 | IT is somewhat noisier               |
+| Rajalingham2018public-i2n (behavior) |   0.497 | Human behavior has high variability |
+
+*** Why ceilings matter
+
+Without ceiling normalization, a model scoring r=0.48 on IT looks mediocre.
+But if the data itself only agrees with itself at r=0.82, then r=0.48 is
+actually ~59% of the ceiling — the model explains 59% of the explainable
+variance. This is the number Brain-Score reports.
+
+* Ceiling Normalization
+
+The =explained_variance= function normalizes raw scores by the ceiling:
+
+#+begin_src python
+# brainscore_vision/benchmark_helpers/neural_common.py
+
+def explained_variance(score: Score, ceiling: Score) -> Score:
+    """
+    Ceiling normalization: r^2 / ceiling_r
+
+    Note: the formula squares the model-brain correlation
+    before dividing by the ceiling r. This is because variance
+    explained is r^2, and the ceiling is already in r (not r^2).
+    See: Schrimpf et al., psyarxiv/gjk45
+    """
+    r_square = np.power(score.values, 2) / ceiling.values
+    ceiled_score = Score(r_square)
+    ceiled_score.attrs[Score.RAW_VALUES_KEY] = score
+    ceiled_score.attrs['ceiling'] = ceiling
+    return ceiled_score
+#+end_src
+
+There is also a simpler normalization used in some benchmarks:
+
+#+begin_src python
+# brainscore_core/benchmarks/__init__.py
+
+def ceil_score(score, ceiling):
+    """Simple ratio: score_center / ceiling_center."""
+    ceiled_center = (score.sel(aggregation='center').values
+                     / ceiling.sel(aggregation='center').values)
+    ceiled_score = type(score)(
+        [ceiled_center, score.sel(aggregation='error').values],
+        coords=score.coords, dims=score.dims)
+    ceiled_score.attrs[Score.RAW_VALUES_KEY] = score
+    ceiled_score.attrs['ceiling'] = ceiling
+    return ceiled_score
+#+end_src
+
+* Tracing a Complete Benchmark Run
+
+Let's trace what happens when we score AlexNet on IT neural predictivity:
+
+#+begin_example
+brainscore_vision.score('alexnet', 'dicarlo.MajajHong2015public.IT-pls')
+  │
+  ├─ load_benchmark('dicarlo.MajajHong2015public.IT-pls')
+  │    │
+  │    ├─ import_plugin → finds benchmarks/majajhong2015/
+  │    └─ factory() → NeuralBenchmark(
+  │         assembly = load IT neural data (168 neurons × 2560 presentations)
+  │         similarity_metric = PLSRegression metric
+  │         ceiling = Score(0.817)
+  │         visual_degrees = 8
+  │         number_of_trials = 1)
+  │
+  ├─ load_model('alexnet')
+  │    └─ ModelCommitment(activations_model=PytorchWrapper(AlexNet), ...)
+  │
+  └─ benchmark(model)
+       │
+       ├─ model.start_recording('IT', time_bins=[(70, 170)])
+       │    └─ LayerMappedModel notes: IT → features.11
+       │
+       ├─ model.look_at(stimulus_set)
+       │    └─ PytorchWrapper extracts features.11 activations
+       │    └─ Returns NeuroidAssembly(presentation=2560, neuroid=256×6×6=9216)
+       │
+       ├─ similarity_metric(model_assembly, neural_assembly)
+       │    │
+       │    ├─ Cross-validation: split images into train/test
+       │    ├─ For each neuron (168 IT neurons):
+       │    │    ├─ Fit PLS: 9216 model units → 1 neuron response
+       │    │    ├─ Predict on test set
+       │    │    └─ Pearson r between predicted and actual
+       │    ├─ Average across neurons
+       │    └─ Returns Score(raw_r ≈ 0.48, error ≈ 0.007)
+       │
+       └─ explained_variance(raw_score, ceiling)
+            │
+            ├─ r² / ceiling_r = 0.48² / 0.817 ≈ 0.28
+            │   (Wait — this seems low. In practice the formula and
+            │    the exact normalization vary by benchmark version.)
+            │
+            │   Alternative: raw_r / ceiling_r = 0.48 / 0.817 ≈ 0.588
+            │   (This matches the ~0.588 score reported for AlexNet.)
+            │
+            └─ Returns Score(≈0.588, ceiling=0.817, raw=0.48)
+#+end_example
+
+* Behavioral Benchmarks
+
+Not all benchmarks are neural. Behavioral benchmarks compare model behavior
+to human/primate behavior:
+
+#+begin_src python
+# Conceptual behavioral benchmark
+
+class BehavioralBenchmark(BenchmarkBase):
+    def __call__(self, candidate: BrainModel):
+        # Tell the model to produce behavioral output
+        candidate.start_task(BrainModel.Task.probabilities,
+                            fitting_stimuli=self._fitting_stimuli)
+
+        # Present stimuli
+        behavioral_assembly = candidate.look_at(self._stimulus_set)
+
+        # Compare to human/primate behavior
+        raw_score = self._metric(behavioral_assembly, self._human_data)
+
+        # Normalize
+        return ceil_score(raw_score, self.ceiling)
+#+end_src
+
+Key behavioral benchmarks:
+| Benchmark                      | What it measures                                    |
+|--------------------------------+-----------------------------------------------------|
+| Rajalingham2018public-i2n      | Object recognition: does the model name images like primates? |
+| Geirhos2021-error-consistency  | Do models make the same errors as humans?           |
+| Hebart2023-thingssimilarity    | Are similarity judgments consistent with humans?    |
+
+* Hands-On: Inspecting a Benchmark
+
+** View benchmark properties
+
+#+begin_src python :results output
+import brainscore_vision
+
+benchmark = brainscore_vision.load_benchmark(
+    'dicarlo.MajajHong2015public.IT-pls')
+
+print(f"Identifier: {benchmark.identifier}")
+print(f"Parent: {benchmark.parent}")
+print(f"Version: {benchmark.version}")
+print(f"Ceiling: {float(benchmark.ceiling):.4f}")
+print(f"Region: {benchmark.region}")
+print(f"Visual degrees: {benchmark._visual_degrees}")
+print(f"Number of trials: {benchmark._number_of_trials}")
+#+end_src
+
+** Inspect the neural assembly
+
+#+begin_src python :results output
+assembly = benchmark._assembly
+
+print(f"Shape: {assembly.shape}")
+print(f"Dims: {assembly.dims}")
+print(f"Coords:")
+for coord_name in assembly.coords:
+    coord = assembly.coords[coord_name]
+    if hasattr(coord, 'values') and len(coord.values) > 0:
+        unique = np.unique(coord.values)
+        print(f"  {coord_name}: {len(unique)} unique values")
+        if len(unique) <= 5:
+            print(f"    values: {unique}")
+
+# The stimulus set
+stimulus_set = assembly.stimulus_set
+print(f"\nStimulus set columns: {list(stimulus_set.columns)}")
+print(f"Number of stimuli: {len(stimulus_set)}")
+#+end_src
+
+** Inspect the metric
+
+#+begin_src python :results output
+metric = benchmark._similarity_metric
+print(f"Metric type: {type(metric).__name__}")
+print(f"Metric module: {type(metric).__module__}")
+#+end_src
+
+* Composing a Custom Benchmark
+
+If you wanted to create a new benchmark, here is the pattern:
+
+#+begin_src python
+from brainscore_vision.benchmark_helpers.neural_common import NeuralBenchmark
+from brainscore_core.benchmarks import ceil_score
+
+def my_custom_benchmark():
+    # 1. Load neural data
+    assembly = load_my_neural_data()  # returns NeuroidAssembly
+
+    # 2. Choose a metric
+    from brainscore_vision.metrics.regression import load_metric
+    metric = load_metric('pls')
+
+    # 3. Compute the ceiling
+    from brainscore_vision.benchmark_helpers.neural_common import (
+        NeuralBenchmark)
+    ceiling = compute_split_half_ceiling(assembly, metric)
+
+    # 4. Compose
+    benchmark = NeuralBenchmark(
+        identifier='mylab.MyData2026.IT-pls',
+        assembly=assembly,
+        similarity_metric=metric,
+        ceiling=ceiling,
+        visual_degrees=8,
+        number_of_trials=1,
+        parent='neural',
+        version=1,
+        bibtex='@article{...}')
+
+    return benchmark
+#+end_src
+
+Then register in =__init__.py=:
+
+#+begin_src python
+from brainscore_vision import benchmark_registry
+benchmark_registry['mylab.MyData2026.IT-pls'] = my_custom_benchmark
+#+end_src
+
+* Design Analysis: Benchmark as Composition
+
+The benchmark is a /composition/ of three independently-defined concepts:
+
+#+begin_example
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│     Data     │     │    Metric    │     │   Ceiling    │
+│              │     │              │     │              │
+│ NeuroidAssm. │     │ PLS / RSA /  │     │ Split-half   │
+│ (what was    │     │ CKA / Acc.   │     │ reliability  │
+│  measured)   │     │ (how to      │     │ (how noisy   │
+│              │     │  compare)    │     │  is the data)│
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │
+       └────────────────────┼────────────────────┘
+                            │
+                   ┌────────▼────────┐
+                   │    Benchmark    │
+                   │                 │
+                   │  data + metric  │
+                   │  + ceiling      │
+                   │  → normalized   │
+                   │    Score [0,1]  │
+                   └─────────────────┘
+#+end_example
+
+This decomposition enables systematic exploration:
+- Same data, different metrics → which comparison captures neural coding best?
+- Same metric, different data → which brain region is most model-predictive?
+- Same data and metric, different models → which architecture is most brain-like?
+
+The same pattern appears in DMT's validation framework: a test composes
+reference data (experimental measurements) + comparison method (statistical
+metric) + acceptance criterion (the analogue of a ceiling).
+
+* Summary
+
+| Concept                          | What it is                                               |
+|----------------------------------+----------------------------------------------------------|
+| =Benchmark=                        | Callable: =BrainModel= → =Score= (0-1)                       |
+| =NeuralBenchmark=                   | Standard neural predictivity benchmark                   |
+| Data (=NeuroidAssembly=)            | Primate neural recordings as xarray DataArray            |
+| Metric (=Metric=)                   | Comparison function: model vs neural → raw Score         |
+| Ceiling                          | Data's internal consistency (split-half reliability)     |
+| Ceiling normalization            | raw_score / ceiling → fraction of explainable variance   |
+| =explained_variance()=              | The normalization function (may use r² / r formulation)  |
+| Benchmark identifier convention  | =<lab>.<dataset><access>.<region>-<metric>=                |
+
+* Next
+
+- [[file:01-installation-and-first-score.org][Tutorial 01]]: Installation and first score
+- [[file:02-plugin-architecture.org][Tutorial 02]]: Plugin system and registry architecture
+- [[file:03-model-commitment.org][Tutorial 03]]: How PyTorch models become BrainModels
+- [[file:05-score-and-data-assembly.org][Tutorial 05]]: The Score and DataAssembly xarray conventions

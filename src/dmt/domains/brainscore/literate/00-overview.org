@@ -1,0 +1,182 @@
+#+TITLE: WP-00 — brain-score-dmt: Package Overview
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+OPTIONS: toc:2 num:t H:3
+
+* Motivation
+
+Brain-Score is a community-driven platform that benchmarks AI models against
+neural and behavioral data. It is the instrument by which computational
+neuroscience measures whether an artificial network's internal representations
+/align/ with the brain's. Researchers submit models; the platform scores them
+against 100+ benchmarks spanning vision, language, and (soon) other modalities.
+The result is a single number — a Brain-Score — quantifying how "brain-like" a
+model is.
+
+The platform works. But its engineering has grown organically, and several design
+choices that were pragmatic in 2018 now create friction:
+
+1. *Plugin discovery by text search.* Brain-Score finds models and benchmarks by
+   scanning =__init__.py= files for literal strings like
+   =model_registry['alexnet']=. This is fragile — rename a variable, and the
+   scanner breaks silently.
+
+2. *No interface enforcement.* =BrainModel= is an informal contract: the ABC
+   declares methods, but nothing verifies that a plugin actually implements them
+   until a benchmark tries to call a missing method at scoring time. Failures
+   surface late, in CI/CD logs, not at registration.
+
+3. *Shared mutable registries.* The global =model_registry= and
+   =benchmark_registry= are plain Python dicts. Any code can write to them
+   without validation. There is no distinction between "registered and
+   validated" vs. "registered and maybe broken."
+
+These are not catastrophic problems. They are the kind of engineering debt that
+accumulates in any research platform that prioritizes /getting science done/ over
+infrastructure polish. But they are the kind of problems that a research engineer
+— someone whose job is maintaining the platform — should be able to name
+precisely and address incrementally.
+
+* What brain-score-dmt Is
+
+=brain-score-dmt= is a lightweight metaprogramming layer that wraps /over/
+Brain-Score's existing plugin system. It does not replace Brain-Score. It adds
+three things:
+
+1. *Interface enforcement at registration time.* Define a formal =Interface=
+   (what methods must a =BrainModel= provide?), then validate any implementation
+   against it /before/ it enters the registry. Fail fast, with a clear error
+   message listing /all/ missing methods.
+
+2. *Validated plugin registries.* Replace the plain =dict= with a
+   =PluginRegistry= that knows its interface and validates entries. Decorator-based
+   registration (=@register('alexnet')=) replaces ad-hoc dict assignment.
+
+3. *Python-native discovery.* =__init_subclass__= replaces text search. Subclass
+   =ModelPlugin= with =identifier='alexnet'= and the class is registered at
+   definition time — no scanning, no string matching, no magic.
+
+The system is backward-compatible. A compatibility bridge (=compat.py=) syncs
+entries between DMT-style registries and Brain-Score's existing plain dicts. New
+plugins use the DMT style; legacy plugins continue to work untouched.
+
+* Provenance: DMT at the Blue Brain Project
+
+The name "DMT" comes from Digital Model Testing, a validation framework built at
+the Blue Brain Project (EPFL) for comparing biophysical neural circuit models
+against experimental data. DMT and Brain-Score solve the same problem at
+different levels of abstraction:
+
+| Axis                     | DMT (BBP)                                           | Brain-Score (Schrimpf)                                |
+|--------------------------+-----------------------------------------------------+-------------------------------------------------------|
+| Abstraction level        | Biophysical: ion channels, synapses, circuits       | Functional: representations, behavior                 |
+| What's compared          | Circuit model output vs. electrophysiology          | AI model activations vs. neural recordings            |
+| Benchmark pattern        | Test = reference data + comparison method            | Benchmark = assembly + metric + ceiling               |
+| Plugin discovery         | =__init_subclass__= + entry points (later)            | Text search on =__init__.py= files                      |
+| Interface enforcement    | =InterfaceMeta= metaclass (had bugs)                  | Informal ABC (no enforcement)                         |
+| Adapter pattern          | =@adapts= / =@implements= decorators                   | =ModelCommitment= wraps =PytorchWrapper=                  |
+| Orchestration            | SLURM HPC batch pipeline (=connsense-TAP=)            | Jenkins GPU scoring + GitHub Actions                  |
+| Data currency            | HDF5 hierarchical stores                            | xarray =DataAssembly= (netCDF4, S3)                    |
+
+DMT's metaclass approach (=InterfaceMeta=) worked but had two bugs:
+
+1. *Shared registry.* All =Interface= subclasses shared a single
+   =__implementation_registry__= list — registering a =BrainModel= implementation
+   also appeared in the =Benchmark= registry. A mutable class attribute on the
+   base class.
+
+2. *Partial validation.* =validate()= reported only the /first/ missing method,
+   not all of them. Fixing one missing method revealed the next, requiring
+   iterative debugging.
+
+=brain-score-dmt= fixes both:
+
+- Each =Interface= subclass gets its own =__implementation_registry__= dict
+  (initialized in =__init_subclass__=, not inherited).
+- =validate()= returns /all/ missing methods in one call.
+
+And it drops the metaclass entirely in favor of =__init_subclass__=, eliminating
+MRO conflicts when mixing with other base classes (e.g., =torch.nn.Module=).
+
+* Package Architecture
+
+The package has six modules, organized in dependency layers:
+
+#+begin_example
+Layer 0 (no internal imports):
+  interface.py      — Interface base class
+  brain_model.py    — Brain-Score interface declarations
+
+Layer 1 (depends on Layer 0):
+  registry.py       — PluginRegistry (validated dict)
+  adapter.py        — @adapts, @implements decorators
+
+Layer 2 (depends on Layers 0–1):
+  plugin.py         — ModelPlugin, BenchmarkPlugin (auto-registering)
+  compat.py         — Brain-Score compatibility bridge
+
+Layer 3:
+  __init__.py       — Public API re-exports
+#+end_example
+
+** Module Dependency Graph
+
+#+begin_example
+__init__.py
+  ├── interface.py          ← Layer 0
+  ├── brain_model.py        ← Layer 0 (imports interface)
+  ├── adapter.py            ← Layer 1 (imports interface)
+  ├── registry.py           ← Layer 1 (imports interface)
+  ├── plugin.py             ← Layer 2 (imports registry, brain_model)
+  └── compat.py             ← Layer 2 (imports interface, brain_model, registry)
+#+end_example
+
+** File Inventory
+
+| File              | Lines | Purpose                                              |
+|-------------------+-------+------------------------------------------------------|
+| =interface.py=      |   101 | =Interface= base class, =__init_subclass__= machinery     |
+| =brain_model.py=    |    69 | =BrainModelInterface=, =BenchmarkInterface=, =MetricInterface= |
+| =registry.py=       |   113 | =PluginRegistry= — validated dict with decorator API   |
+| =adapter.py=        |   107 | =@adapts=, =@implements= — parametric class decorators    |
+| =plugin.py=         |   145 | =ModelPlugin=, =BenchmarkPlugin=, etc.                   |
+| =compat.py=         |   123 | Bidirectional bridge to Brain-Score dicts             |
+| =__init__.py=       |    89 | Public API, =__all__=                                  |
+| Total             |   747 |                                                      |
+
+Plus =examples/= (AlexNet model, MajajHong2015 benchmark) and =tests/= (4 files,
+44 test cases, all passing).
+
+* Design Principles
+
+1. *Fail fast, fail completely.* Missing interface methods are caught at
+   registration time, not at scoring time. All missing methods are reported in
+   one error, not one at a time.
+
+2. *No metaclasses.* =__init_subclass__= provides the same hook points as a
+   metaclass without MRO conflicts. This matters when wrapping PyTorch models.
+
+3. *Backward compatible.* The compatibility bridge allows incremental adoption.
+   Existing Brain-Score plugins work unchanged. New plugins get validation.
+
+4. *Minimal.* 747 lines total. No external dependencies beyond Python stdlib.
+   The only assumption about Brain-Score is that registries are dicts and
+   interfaces define certain methods.
+
+5. *Testable in isolation.* The package uses stub types for Brain-Score classes
+   (=ModelCommitment=, =NeuralBenchmark=, =Score=) so tests run without
+   installing =brainscore_vision=.
+
+* Reading Order
+
+The literate files are numbered to follow dependency order:
+
+| File              | Reads                                  | Requires understanding of |
+|-------------------+----------------------------------------+---------------------------|
+| [[file:01-interface.org][WP-01: Interface]]   | =interface.py=                           | Python class machinery    |
+| [[file:02-brain-model.org][WP-02: Brain Model]] | =brain_model.py=                         | WP-01                     |
+| [[file:03-registry.org][WP-03: Registry]]    | =registry.py=                            | WP-01                     |
+| [[file:04-adapter.org][WP-04: Adapter]]     | =adapter.py=                             | WP-01                     |
+| [[file:05-plugin.org][WP-05: Plugin]]      | =plugin.py=                              | WP-01, WP-02, WP-03      |
+| [[file:06-compat.org][WP-06: Compat]]      | =compat.py=                              | WP-01, WP-02, WP-03      |
+| [[file:07-init.org][WP-07: Init]]        | =__init__.py=                            | All above                 |

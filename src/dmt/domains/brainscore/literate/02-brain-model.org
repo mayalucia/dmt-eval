@@ -1,0 +1,184 @@
+#+TITLE: WP-02 — Brain-Score Interfaces as Formal Contracts
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+PROPERTY: header-args :tangle ../brain_model.py
+#+OPTIONS: toc:2 num:t H:3
+
+* Introduction
+
+Brain-Score defines three core abstractions:
+
+- *BrainModel*: something you can show stimuli to and get neural-like responses
+- *Benchmark*: a test that scores a model against brain/behavioral data
+- *Metric*: a comparison function that takes two assemblies and returns a score
+
+In Brain-Score's codebase, these are informal: =BrainModel= is an ABC
+(=brainscore_core.benchmarks.BrainModel=), but Python ABCs only enforce at
+instantiation, not at registration. A class that inherits =BrainModel= but forgets
+=start_recording()= can be instantiated and registered without error — the
+=AbstractMethod= check fires only if someone calls =BrainModel()= directly, which
+no one does because plugins use factories.
+
+This module formalizes the three interfaces using the =Interface= machinery from
+[[file:01-interface.org][WP-01]]. The method signatures are drawn from Brain-Score's actual codebase
+(=brainscore_core= and =brainscore_vision=), preserving the exact API contract.
+
+* Source
+
+#+begin_src python
+"""
+Brain-Score interfaces expressed as proper Interface declarations.
+
+Brain-Score defines BrainModel, Benchmark, and Metric as informal
+interfaces (ABC with no enforcement). Here we formalize them: any
+class claiming to be a BrainModel must actually have look_at(),
+start_recording(), etc. — verified at registration time, not at
+runtime failure.
+"""
+
+from __future__ import annotations
+
+from .interface import Interface
+
+
+class BrainModelInterface(Interface):
+    """The contract every model must fulfill for Brain-Score benchmarks.
+
+    Mirrors brainscore_vision.model_interface.BrainModel, but enforced.
+    """
+
+    def identifier(self) -> str:
+        """Unique model name, e.g. 'alexnet'."""
+        ...
+
+    def visual_degrees(self) -> int:
+        """How many visual degrees the model's input subtends."""
+        ...
+
+    def start_task(self, task, fitting_stimuli):
+        """Configure the model for a behavioral task."""
+        ...
+
+    def start_recording(self, recording_target, time_bins):
+        """Configure the model to record from a brain region."""
+        ...
+
+    def look_at(self, stimuli, number_of_trials=1):
+        """Present stimuli, return NeuroidAssembly or BehavioralAssembly."""
+        ...
+
+
+class BenchmarkInterface(Interface):
+    """The contract every benchmark must fulfill.
+
+    Mirrors brainscore_core.benchmarks.Benchmark.
+    """
+
+    def identifier(self) -> str:
+        """Benchmark identifier, e.g. 'dicarlo.MajajHong2015public.IT-pls'."""
+        ...
+
+    def ceiling(self):
+        """Data reliability estimate (Score)."""
+        ...
+
+
+class MetricInterface(Interface):
+    """The contract every metric must fulfill.
+
+    Mirrors brainscore_core.metrics.Metric.
+    """
+    pass
+    # Note: Metric's contract is __call__(assembly1, assembly2) -> Score.
+    # __call__ is a dunder, so it's not captured by Interface.__init_subclass__.
+    # This is a deliberate design choice: __call__ is universal, not specific
+    # to the Metric contract. Validation of __call__ signature would require
+    # inspect.signature, which is fragile with C extensions and wrappers.
+    # For Metric, the interface is effectively "be callable with two assemblies."
+#+end_src
+
+* Commentary
+
+** =BrainModelInterface=: The Five-Method Contract
+
+The five methods map directly to how benchmarks interact with models:
+
+| Method             | Called by                | Purpose                                      |
+|--------------------+--------------------------+----------------------------------------------|
+| =identifier=         | Registry, logging        | Unique name for results storage               |
+| =visual_degrees=     | Stimulus presentation    | Input size calibration (degrees of visual arc) |
+| =start_task=         | Behavioral benchmarks    | Configure for object recognition, etc.        |
+| =start_recording=    | Neural benchmarks        | Select brain region (V1, V4, IT) to record    |
+| =look_at=            | All benchmarks           | The core operation: stimulus → response       |
+
+The typical scoring sequence is:
+
+#+begin_example
+model.start_recording('IT', time_bins=...)   # benchmark configures the model
+assembly = model.look_at(stimuli)            # benchmark presents stimuli
+score = metric(assembly, neural_data)        # metric compares to brain data
+#+end_example
+
+If any of these methods is missing, the scoring fails — but not until the
+benchmark tries to call it. The interface ensures they're all present at
+registration time.
+
+** =BenchmarkInterface=: Minimal by Design
+
+A benchmark needs only =identifier= (for results storage) and =ceiling= (the
+internal consistency estimate that normalizes scores). The actual scoring
+happens through =__call__(candidate)=, which is a dunder and therefore not
+captured by our interface machinery.
+
+This is the right trade-off: enforcing =identifier= and =ceiling= catches the
+most common registration errors (benchmarks that forget their identifier),
+while =__call__= is too universal to meaningfully validate.
+
+** =MetricInterface=: The Empty Contract
+
+=MetricInterface= has no required methods. This might look like a mistake, but
+it's deliberate:
+
+- A metric's contract is =__call__(assembly1, assembly2) -> Score=
+- =__call__= is a dunder → not captured by =__init_subclass__=
+- Validating the /signature/ of =__call__= (two positional args) would require
+  =inspect.signature=, which is fragile with C extensions, wrappers, and
+  functools decorations
+
+The =MetricInterface= exists as a type marker — it participates in the
+interface hierarchy and can be used for documentation and future extension —
+but currently imposes no structural requirement.
+
+** Why Not Use Python's =abc.ABC=?
+
+Python's =ABC= mechanism enforces abstract methods at instantiation:
+
+#+begin_example python
+from abc import ABC, abstractmethod
+
+class BrainModel(ABC):
+    @abstractmethod
+    def look_at(self, stimuli): ...
+
+BrainModel()  # TypeError: Can't instantiate abstract class
+#+end_example
+
+But this doesn't help Brain-Score because plugins don't instantiate the ABC.
+They use factory functions:
+
+#+begin_example python
+model_registry['alexnet'] = lambda: ModelCommitment(...)
+#+end_example
+
+=ModelCommitment= doesn't inherit from =BrainModel= — it's a separate adapter
+class that /happens/ to implement the right methods. The ABC never fires.
+
+Our =Interface= validates by /structural/ conformance (does the class have these
+methods?), not by /nominal/ conformance (does it inherit from this class?).
+This is closer to Go's interfaces or Rust's traits than to Java's.
+
+* Cross-References
+
+- [[file:01-interface.org][WP-01: Interface]] — the base class this module uses
+- [[file:05-plugin.org][WP-05: Plugin]] — uses these interfaces to create validated registries
+- [[file:06-compat.org][WP-06: Compat]] — validates Brain-Score entries against these interfaces

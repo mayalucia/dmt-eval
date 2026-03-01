@@ -1,0 +1,254 @@
+#+TITLE: WP-06 — Compatibility Bridge: Coexisting with Brain-Score
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+PROPERTY: header-args :tangle ../compat.py
+#+OPTIONS: toc:2 num:t H:3
+
+* Introduction
+
+This module solves the adoption problem: Brain-Score has hundreds of existing
+plugins registered as lambda factories in plain dicts. You cannot replace them
+all at once. You need a bridge.
+
+The bridge is bidirectional:
+
+- *DMT → Brain-Score*: push validated registrations from =PluginRegistry= into
+  Brain-Score's plain dicts, so that =brainscore_vision.load_model('alexnet')=
+  works with plugins registered via the DMT system.
+
+- *Brain-Score → DMT*: import existing Brain-Score entries into a
+  =PluginRegistry=, so that DMT's =validate_output()= and =audit_registry()=
+  can be run against legacy plugins.
+
+Additionally, standalone validation functions let you spot-check individual
+factories (=validate_brainscore_model=) or audit an entire registry
+(=audit_registry=).
+
+The core design principle is /incremental adoption/: new plugins use the DMT
+style and get validation for free. Legacy plugins continue to work through the
+compatibility layer. Over time, as plugins are updated, the legacy path
+becomes less used.
+
+* Source
+
+#+begin_src python
+"""
+Compatibility bridge between brain-score-dmt and Brain-Score's existing
+plain-dict registries.
+
+Two directions:
+1. DMT → Brain-Score: push validated registrations into Brain-Score's dicts
+2. Brain-Score → DMT: wrap existing Brain-Score factories with validation
+
+This allows incremental adoption: new plugins use the DMT-style system,
+existing plugins continue to work through the compatibility layer.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Any, Callable, Dict
+
+from .interface import Interface
+from .brain_model import BrainModelInterface, BenchmarkInterface
+from .registry import PluginRegistry
+
+
+def sync_to_brainscore(
+    plugin_registry: PluginRegistry,
+    brainscore_registry: Dict[str, Callable]
+):
+    """Push DMT-style registrations into Brain-Score's plain dicts.
+
+    Entries already in brainscore_registry are not overwritten.
+
+    Usage::
+
+        from brainscore_vision import model_registry as bs_model_registry
+        from brain_score_dmt.plugin import model_registry as dmt_model_registry
+
+        sync_to_brainscore(dmt_model_registry, bs_model_registry)
+        # Now brainscore_vision.load_model('alexnet') works with
+        # plugins registered via the DMT system.
+    """
+    for identifier, factory in plugin_registry.items():
+        if identifier not in brainscore_registry:
+            brainscore_registry[identifier] = factory
+
+
+def sync_from_brainscore(
+    brainscore_registry: Dict[str, Callable],
+    plugin_registry: PluginRegistry
+):
+    """Import Brain-Score plain-dict entries into a DMT PluginRegistry.
+
+    Entries already in plugin_registry are not overwritten.
+    No validation is performed (legacy entries may not conform).
+
+    Usage::
+
+        sync_from_brainscore(bs_model_registry, dmt_model_registry)
+    """
+    for identifier, factory in brainscore_registry.items():
+        if identifier not in plugin_registry:
+            plugin_registry.register_factory(identifier, factory)
+
+
+def validate_brainscore_model(factory: Callable, identifier: str) -> Any:
+    """Call a Brain-Score model factory and validate the output.
+
+    Returns the model if valid. Warns if methods are missing.
+
+    Usage::
+
+        model = validate_brainscore_model(
+            model_registry['alexnet'], 'alexnet')
+    """
+    model = factory()
+    missing = BrainModelInterface.validate(model)
+    if missing:
+        warnings.warn(
+            f"Model '{identifier}' is missing BrainModelInterface methods: "
+            f"{missing}. It may fail on some benchmarks.",
+            stacklevel=2
+        )
+    return model
+
+
+def validate_brainscore_benchmark(factory: Callable, identifier: str) -> Any:
+    """Call a Brain-Score benchmark factory and validate the output."""
+    benchmark = factory()
+    missing = BenchmarkInterface.validate(benchmark)
+    if missing:
+        warnings.warn(
+            f"Benchmark '{identifier}' is missing BenchmarkInterface methods: "
+            f"{missing}.",
+            stacklevel=2
+        )
+    return benchmark
+
+
+def audit_registry(
+    brainscore_registry: Dict[str, Callable],
+    interface: type[Interface]
+) -> dict[str, list[str]]:
+    """Audit an entire Brain-Score registry for interface compliance.
+
+    Calls every factory and validates the output. Returns a dict
+    mapping identifier → list of missing methods (empty if compliant).
+
+    This is expensive (instantiates every plugin). Use for CI/testing.
+
+    Usage::
+
+        issues = audit_registry(model_registry, BrainModelInterface)
+        for name, missing in issues.items():
+            if missing:
+                print(f"{name}: missing {missing}")
+    """
+    results = {}
+    for identifier, factory in brainscore_registry.items():
+        try:
+            obj = factory()
+            results[identifier] = interface.validate(obj)
+        except Exception as e:
+            results[identifier] = [f"ERROR: {e}"]
+    return results
+#+end_src
+
+* Commentary
+
+** Sync Direction Matters
+
+The two sync functions have different trust levels:
+
+*** =sync_to_brainscore=: Validated → Unvalidated
+
+DMT-style registrations have already been validated (either by =@register=
+decorator or by =ModelPlugin.__init_subclass__=). Pushing them into Brain-Score's
+plain dict is safe — they're known-good entries.
+
+"Entries already in brainscore_registry are not overwritten" prevents DMT from
+clobbering a Brain-Score entry that may have been patched or overridden. The
+Brain-Score dict is the authoritative production registry; DMT supplements it,
+doesn't replace it.
+
+*** =sync_from_brainscore=: Unvalidated → Validated Registry
+
+Legacy entries haven't been validated. We use =register_factory()= (which skips
+validation) rather than =@register= (which would validate the factory class).
+This is deliberate: many legacy factories are lambdas, not classes, and can't
+be validated without calling them.
+
+The intent is: import them so we can /later/ validate their outputs with
+=validate_output()= or =audit_registry()=.
+
+** =validate_brainscore_model()=: Warn, Don't Raise
+
+#+begin_example python
+model = factory()
+missing = BrainModelInterface.validate(model)
+if missing:
+    warnings.warn(...)
+return model
+#+end_example
+
+Note: it /warns/, it doesn't /raise/. This is a diagnostic function, not an
+enforcement gate. Legacy models that are missing methods may still work for
+/some/ benchmarks — a vision model might work with behavioral benchmarks
+(which only call =look_at=) but fail on neural benchmarks (which call
+=start_recording=). Raising would break these partial-use cases.
+
+The =stacklevel=2= ensures the warning points to the /caller's/ line, not to
+=validate_brainscore_model= itself.
+
+** =audit_registry()=: The CI Function
+
+#+begin_example python
+for identifier, factory in brainscore_registry.items():
+    try:
+        obj = factory()
+        results[identifier] = interface.validate(obj)
+    except Exception as e:
+        results[identifier] = [f"ERROR: {e}"]
+#+end_example
+
+This is the expensive function — it calls /every/ factory in the registry and
+validates the output. The =try/except= catches factories that fail to construct
+(missing dependencies, download errors, etc.) and reports them as =ERROR=
+entries rather than crashing the audit.
+
+Intended use: a CI job that runs weekly, reports compliance metrics, and flags
+regressions. The output is a dict you can filter:
+
+#+begin_example python
+noncompliant = {k: v for k, v in results.items() if v}
+print(f"{len(noncompliant)} / {len(results)} plugins have issues")
+#+end_example
+
+** The Adoption Gradient
+
+The compatibility bridge enables a four-stage adoption path:
+
+1. *Audit*: Run =audit_registry()= on the existing Brain-Score registries.
+   Discover which plugins are non-compliant. No code changes.
+
+2. *Validate new plugins*: New plugins use =ModelPlugin=,
+   =BenchmarkPlugin=. Existing plugins untouched. =sync_to_brainscore()= pushes
+   new entries into Brain-Score's dicts.
+
+3. *Retrofit legacy plugins*: Gradually convert lambda registrations to
+   class-based plugins. Each conversion gains validation.
+
+4. *Replace registries*: Eventually, =PluginRegistry= replaces the plain dicts
+   entirely. =sync_to_brainscore()= becomes unnecessary.
+
+This gradient means the transition can happen over months, one plugin at a
+time, without a flag day.
+
+* Cross-References
+
+- [[file:01-interface.org][WP-01: Interface]] — =validate()= used by all validation functions
+- [[file:02-brain-model.org][WP-02: Brain Model]] — =BrainModelInterface=, =BenchmarkInterface= validated against
+- [[file:03-registry.org][WP-03: PluginRegistry]] — =register_factory()= used by =sync_from_brainscore=
+- [[file:05-plugin.org][WP-05: Plugin]] — the registries that are synced

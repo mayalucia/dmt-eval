@@ -1,0 +1,239 @@
+#+TITLE: WP-03 — PluginRegistry: A Dict That Knows What It Holds
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+PROPERTY: header-args :tangle ../registry.py
+#+OPTIONS: toc:2 num:t H:3
+
+* Introduction
+
+Brain-Score's registries are plain Python dicts:
+
+#+begin_example python
+model_registry: Dict[str, Callable[[], BrainModel]] = {}
+benchmark_registry: Dict[str, Callable[[], Benchmark]] = {}
+#+end_example
+
+Any code can assign to them without validation:
+
+#+begin_example python
+model_registry['my_model'] = lambda: BrokenThing()  # no check
+#+end_example
+
+This module replaces the plain dict with =PluginRegistry=, a dict subclass that:
+
+1. Optionally validates entries against an =Interface= at registration time
+2. Provides a =@register= decorator for class-based plugin definitions
+3. Provides =load()= for calling the factory and =validate_output()= for
+   testing the result
+4. Remains backward-compatible: you can still do =registry['key'] = factory=
+
+The design choice to subclass =dict= (rather than wrap it) means that code
+expecting a dict — like Brain-Score's own plugin loader — still works. The
+=PluginRegistry= /is/ a dict, with additional validation on the structured paths.
+
+* Source
+
+#+begin_src python
+"""
+Validated plugin registry.
+
+A PluginRegistry is a dict[str, Callable] that optionally validates
+entries against an Interface. It also provides a @register decorator
+for class-based plugin definitions.
+
+Brain-Score uses plain dicts as registries:
+    model_registry: Dict[str, Callable[[], BrainModel]] = {}
+
+This replaces that with a dict that knows what it holds and can
+validate entries at registration time.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Optional, Type
+
+from .interface import Interface
+
+
+class PluginRegistry(dict):
+    """A registry dict that optionally validates against an Interface.
+
+    Usage::
+
+        model_registry = PluginRegistry('model', BrainModelInterface)
+
+        # Decorator registration (preferred)
+        @model_registry.register('alexnet')
+        class AlexNetPlugin:
+            @classmethod
+            def build(cls):
+                return ModelCommitment(...)
+
+        # Direct assignment (backward compatible)
+        model_registry['alexnet'] = lambda: ModelCommitment(...)
+
+        # Load
+        model = model_registry.load('alexnet')
+    """
+
+    def __init__(self, name: str, interface: Optional[Type[Interface]] = None):
+        super().__init__()
+        self.name = name
+        self.interface = interface
+
+    def register(self, identifier: str):
+        """Class decorator: register a plugin class under identifier.
+
+        The class must define a classmethod ``build()`` that returns
+        the plugin instance. If an interface is set, the class is
+        validated against it at decoration time.
+
+        ::
+
+            @model_registry.register('alexnet')
+            class AlexNetPlugin:
+                @classmethod
+                def build(cls):
+                    return ModelCommitment(...)
+        """
+        def decorator(cls):
+            # Validate the class against the interface if one is set.
+            # We validate the class itself (must have build()), not the
+            # build output (that would require calling the factory).
+            if self.interface is not None:
+                self.interface.register(identifier, cls)
+
+            # Store the factory function
+            if hasattr(cls, 'build') and callable(getattr(cls, 'build')):
+                self[identifier] = cls.build
+            else:
+                raise TypeError(
+                    f"Plugin class {cls.__name__} must define a "
+                    f"classmethod build()"
+                )
+            return cls
+        return decorator
+
+    def register_factory(self, identifier: str, factory: Callable):
+        """Register a bare factory function (lambda or function).
+
+        This is the backward-compatible path: no class, no validation.
+        Equivalent to Brain-Score's model_registry['id'] = lambda: ...
+        """
+        self[identifier] = factory
+
+    def load(self, identifier: str) -> Any:
+        """Load a plugin by identifier: call its factory."""
+        if identifier not in self:
+            raise KeyError(
+                f"No plugin '{identifier}' in {self.name} registry. "
+                f"Available: {sorted(self.keys())}"
+            )
+        return self[identifier]()
+
+    def validate_output(self, identifier: str) -> list[str]:
+        """Build a plugin and validate the output against the interface.
+
+        Returns list of missing methods (empty if compliant).
+        This is expensive (calls the factory) — use for testing, not
+        on every load.
+        """
+        if self.interface is None:
+            return []
+        obj = self.load(identifier)
+        return self.interface.validate(obj)
+
+    def __repr__(self):
+        entries = ', '.join(sorted(self.keys()))
+        return f"PluginRegistry('{self.name}', [{entries}])"
+#+end_src
+
+* Commentary
+
+** Two Registration Paths
+
+The registry supports two ways to add entries, reflecting two audiences:
+
+*** 1. Decorator Registration (New Style)
+
+#+begin_example python
+@model_registry.register('alexnet')
+class AlexNetPlugin:
+    @classmethod
+    def build(cls):
+        return ModelCommitment(...)
+#+end_example
+
+This is the preferred path. The decorator:
+1. Validates the plugin class against the interface (if one is set)
+2. Checks that =build()= exists
+3. Stores =cls.build= as the factory
+
+The class is validated at /decoration time/ — that is, at import. If the class
+doesn't satisfy the interface, you get a =TypeError= immediately, not when
+someone later calls =load()=.
+
+*** 2. Factory Registration (Legacy Compatible)
+
+#+begin_example python
+model_registry.register_factory('alexnet', lambda: ModelCommitment(...))
+model_registry['alexnet'] = lambda: ModelCommitment(...)  # also works
+#+end_example
+
+No validation. This is the backward-compatible path for existing Brain-Score
+plugins that use lambda factories. The =register_factory= method is explicit;
+direct dict assignment (=__setitem__=) also works because =PluginRegistry=
+inherits from =dict=.
+
+** =load()=: Factory Invocation
+
+#+begin_example python
+def load(self, identifier: str) -> Any:
+    if identifier not in self:
+        raise KeyError(...)
+    return self[identifier]()
+#+end_example
+
+=load()= calls the factory and returns the result. The factory is called /every
+time/ — no caching. This is deliberate: Brain-Score models can be stateful
+(they have =start_recording()= / =start_task()= state), and reusing a model
+instance across benchmarks could cause subtle bugs.
+
+The =KeyError= message lists all available plugins. This is a small quality-of-life
+improvement over a bare =KeyError: 'alexnet'= — when a model name is misspelled,
+the available list immediately suggests the right identifier.
+
+** =validate_output()=: Expensive but Thorough
+
+#+begin_example python
+def validate_output(self, identifier: str) -> list[str]:
+    if self.interface is None:
+        return []
+    obj = self.load(identifier)
+    return self.interface.validate(obj)
+#+end_example
+
+This calls the factory and validates the /output object/, not the plugin class.
+It's the strongest validation: the actual model instance is checked against the
+interface.
+
+It's expensive because it instantiates the model (which might download weights,
+allocate GPU memory, etc.). Intended for test suites, not production =load()=
+calls.
+
+** Why Subclass =dict=?
+
+=PluginRegistry(dict)= rather than =PluginRegistry= wrapping a private =._data=
+dict. The reason is interoperability: Brain-Score code that does =for id in
+model_registry:= or =if 'alexnet' in model_registry:= works unchanged. The
+=PluginRegistry= is duck-type-compatible with every dict consumer.
+
+The trade-off: direct =__setitem__= (=registry['key'] = factory=) bypasses
+validation. We accept this for backward compatibility. The validated paths
+(=@register=, =register_factory=) are the recommended API.
+
+* Cross-References
+
+- [[file:01-interface.org][WP-01: Interface]] — the validation engine this registry delegates to
+- [[file:05-plugin.org][WP-05: Plugin]] — creates module-level =PluginRegistry= instances
+- [[file:06-compat.org][WP-06: Compat]] — syncs between =PluginRegistry= and Brain-Score dicts

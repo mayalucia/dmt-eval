@@ -1,0 +1,417 @@
+#+title: Brain-Score Tutorial 02 — Plugin System and Registry Architecture
+#+author: Vishal Sood
+#+date: <2026-02-27 Fri>
+#+options: toc:t num:t
+
+* What This Tutorial Covers
+
+How Brain-Score discovers, loads, and registers plugins — the architectural backbone that makes the platform extensible without modifying core code. By the end you will understand why ~brainscore_vision.score('alexnet', 'MajajHong2015.IT-pls')~ can find and load a model/benchmark defined in an isolated subdirectory.
+
+* The Five Global Registries
+
+Brain-Score uses five plain Python dictionaries as registries. Each maps a string identifier to a zero-argument factory function (not an instance):
+
+#+begin_src python
+# From brainscore_vision/__init__.py
+
+data_registry:         Dict[str, Callable[[], DataAssembly]] = {}
+stimulus_set_registry: Dict[str, Callable[[], StimulusSet]]  = {}
+metric_registry:       Dict[str, Callable[[], Metric]]       = {}
+benchmark_registry:    Dict[str, Callable[[], Benchmark]]     = {}
+model_registry:        Dict[str, Callable[[], BrainModel]]    = {}
+#+end_src
+
+Key design choice: *values are factories, not instances*. The object is created only when the factory is called. This enables lazy loading — a model's PyTorch weights are only downloaded when that model is actually scored.
+
+* Plugin Directory Structure
+
+Each plugin lives in its own subdirectory under the appropriate type:
+
+#+begin_example
+brainscore_vision/
+    models/
+        alexnet/
+            __init__.py        # Registry assignment
+            model.py           # Model construction code
+            requirements.txt   # Optional: plugin-specific deps
+            setup.py           # Optional: if the plugin is a package
+            test.py            # Plugin tests
+            region_layer_map/  # Pre-committed brain-region → layer mappings
+                alexnet.json
+        resnet50_julianser/
+            __init__.py
+            model.py
+            ...
+    benchmarks/
+        majajhong2015/
+            __init__.py        # Registers multiple benchmark variants
+            benchmark.py
+            test.py
+        rajalingham2018/
+            __init__.py
+            ...
+    data/
+        majajhong2015/
+            __init__.py        # Registers data assemblies and stimulus sets
+            ...
+    metrics/
+        regression/
+            __init__.py
+            metric.py
+            ...
+#+end_example
+
+* How a Plugin Registers Itself
+
+Registration is a single line in =__init__.py= — an assignment into the global registry dict:
+
+#+begin_src python
+# brainscore_vision/models/alexnet/__init__.py
+
+from brainscore_vision import model_registry
+from brainscore_vision.model_helpers.brain_transformation import ModelCommitment
+from .model import get_model, get_layers
+
+model_registry['alexnet'] = lambda: ModelCommitment(
+    identifier='alexnet',
+    activations_model=get_model('alexnet'),
+    layers=get_layers('alexnet'))
+#+end_src
+
+The value is a =lambda= — a zero-argument factory. When =model_registry['alexnet']()= is called later, it constructs the =ModelCommitment= object, which in turn loads the PyTorch model.
+
+A benchmark plugin may register multiple variants:
+
+#+begin_src python
+# brainscore_vision/benchmarks/majajhong2015/__init__.py
+
+from brainscore_vision import benchmark_registry
+
+benchmark_registry['dicarlo.MajajHong2015public.V4-pls'] = (
+    lambda: load_assembly_and_build_benchmark('V4'))
+benchmark_registry['dicarlo.MajajHong2015public.IT-pls'] = (
+    lambda: load_assembly_and_build_benchmark('IT'))
+#+end_src
+
+* Plugin Discovery: =ImportPlugin.locate_plugin()=
+
+When you call =brainscore_vision.load_model('alexnet')=, Brain-Score needs to find /which subdirectory/ contains the alexnet registration. This is done by text search — no metaclasses, no decorators, no importlib magic:
+
+#+begin_src python
+# brainscore_core/plugin_management/import_plugin.py
+
+class ImportPlugin:
+    def __init__(self, library_root, plugin_type, identifier, registry_prefix=None):
+        """
+        :param library_root: 'brainscore_vision'
+        :param plugin_type:  'models'
+        :param identifier:   'alexnet'
+        """
+        self.plugin_type = plugin_type
+        library_module = __import__(library_root)
+        library_directory = Path(library_module.__file__).parent
+        self.plugins_dir = library_directory / plugin_type
+        self.identifier = identifier
+        registry_prefix = registry_prefix or self.plugin_type.strip('s')
+        self.registry_name = registry_prefix + '_registry'  # 'model_registry'
+        self.plugin_dirname = self.locate_plugin()
+
+    def locate_plugin(self) -> str:
+        """
+        Scans __init__.py files in all plugin subdirectories for:
+            model_registry['alexnet'] = ...
+        Returns the directory name where found. Asserts exactly one match.
+        """
+        plugins = [d.name for d in self.plugins_dir.iterdir() if d.is_dir()]
+        specified_plugin_dirname = None
+        plugin_registrations_count = 0
+
+        for plugin_dirname in plugins:
+            if plugin_dirname.startswith('.') or plugin_dirname.startswith('_'):
+                continue
+            init_file = self.plugins_dir / plugin_dirname / "__init__.py"
+            if not init_file.is_file():
+                continue
+            with open(init_file, encoding='utf-8') as f:
+                plugin_registrations = [
+                    line for line in f
+                    if f"{self.registry_name}['{self.identifier}']"
+                       in line.replace('"', "'")
+                ]
+                if len(plugin_registrations) > 0:
+                    specified_plugin_dirname = plugin_dirname
+                    plugin_registrations_count += 1
+
+        assert plugin_registrations_count == 1, \
+            f"Expected 1 registration for {self.identifier}, found {plugin_registrations_count}"
+        return specified_plugin_dirname
+#+end_src
+
+This is deliberately simple. The discovery mechanism is a string match on =model_registry['alexnet']= inside =__init__.py= files. No AST parsing, no decorators. The string must appear literally.
+
+* Dependency Installation
+
+Each plugin can declare its own dependencies via =requirements.txt= or =setup.py=. After locating the plugin directory, =ImportPlugin= installs them before importing:
+
+#+begin_src python
+def install_requirements(self):
+    setup_file = self.plugins_dir / self.plugin_dirname / 'setup.py'
+    requirements_file = self.plugins_dir / self.plugin_dirname / 'requirements.txt'
+    if setup_file.is_file():
+        subprocess.run(f"pip install {self.plugins_dir / self.plugin_dirname}",
+                       shell=True)
+    if requirements_file.is_file():
+        subprocess.run(f"pip install -r {requirements_file}",
+                       shell=True)
+#+end_src
+
+Controlled by the =BS_INSTALL_DEPENDENCIES= environment variable:
+- =yes= (default): install before importing
+- =no=: skip installation (for CI or pre-built environments)
+- =newenv=: install even if already present
+
+* The Import Side-Effect
+
+After locating and installing, the actual loading is a dynamic import:
+
+#+begin_src python
+def import_plugin(library_root, plugin_type, identifier, registry_prefix=None):
+    importer = ImportPlugin(
+        library_root=library_root,
+        plugin_type=plugin_type,
+        identifier=identifier,
+        registry_prefix=registry_prefix)
+    if installation_preference() != 'no':
+        importer.install_requirements()
+    # This import executes the __init__.py, which runs:
+    #   model_registry['alexnet'] = lambda: ModelCommitment(...)
+    __import__(f'{library_root}.{plugin_type}.{importer.plugin_dirname}')
+#+end_src
+
+The =__import__= call triggers Python's normal module loading. As a /side effect/ of importing the plugin's =__init__.py=, the registry assignment line executes, populating the global dictionary.
+
+* The Load → Score Pipeline
+
+Here is the complete chain from =brainscore_vision.score()= to result:
+
+#+begin_src python
+# brainscore_vision/__init__.py
+
+def score(model_identifier, benchmark_identifier, conda_active=False):
+    return wrap_score(__file__,
+                      model_identifier=model_identifier,
+                      benchmark_identifier=benchmark_identifier,
+                      score_function=_run_score,
+                      conda_active=conda_active)
+
+def _run_score(model_identifier, benchmark_identifier):
+    model     = load_model(model_identifier)
+    benchmark = load_benchmark(benchmark_identifier)
+    score     = benchmark(model)
+    score.attrs['model_identifier'] = model_identifier
+    score.attrs['benchmark_identifier'] = benchmark_identifier
+    return score
+
+def load_model(identifier):
+    import_plugin('brainscore_vision', 'models', identifier)
+    return model_registry[identifier]()   # Call the factory
+
+def load_benchmark(identifier):
+    import_plugin('brainscore_vision', 'benchmarks', identifier)
+    return benchmark_registry[identifier]()  # Call the factory
+#+end_src
+
+Trace for =score('alexnet', 'dicarlo.MajajHong2015public.IT-pls')=:
+
+#+begin_example
+1. import_plugin('brainscore_vision', 'models', 'alexnet')
+   → locate_plugin() scans models/*/__init__.py for "model_registry['alexnet']"
+   → finds it in models/alexnet/
+   → installs models/alexnet/requirements.txt
+   → __import__('brainscore_vision.models.alexnet')
+   → side-effect: model_registry['alexnet'] = lambda: ModelCommitment(...)
+
+2. model_registry['alexnet']()
+   → calls the lambda
+   → constructs ModelCommitment(identifier='alexnet', activations_model=..., layers=...)
+   → ModelCommitment downloads AlexNet weights (first run only)
+
+3. import_plugin('brainscore_vision', 'benchmarks', 'dicarlo.MajajHong2015public.IT-pls')
+   → locate_plugin() scans benchmarks/*/__init__.py
+   → finds it in benchmarks/majajhong2015/
+   → __import__('brainscore_vision.benchmarks.majajhong2015')
+   → side-effect: benchmark_registry['dicarlo.MajajHong2015public.IT-pls'] = lambda: ...
+
+4. benchmark_registry['dicarlo.MajajHong2015public.IT-pls']()
+   → calls the lambda
+   → constructs NeuralBenchmark(assembly=..., metric=..., ceiling=...)
+   → downloads neural assembly data (first run only)
+
+5. benchmark(model)
+   → NeuralBenchmark.__call__(model)
+   → returns ceiling-normalized Score
+#+end_example
+
+* Hands-On: Exploring the Registries
+
+** List all registered models (after importing)
+
+#+begin_src python :results output
+from brainscore_vision import model_registry
+from brainscore_vision.model_helpers.brain_transformation import ModelCommitment
+
+# At this point, only manually-imported models are in the registry.
+# To see what's available, we can scan the filesystem:
+from pathlib import Path
+import brainscore_vision
+
+models_dir = Path(brainscore_vision.__file__).parent / 'models'
+model_dirs = sorted([d.name for d in models_dir.iterdir()
+                     if d.is_dir() and not d.name.startswith(('_', '.'))])
+
+print(f"Found {len(model_dirs)} model plugin directories:")
+for name in model_dirs[:10]:
+    print(f"  {name}")
+print("  ...")
+#+end_src
+
+** Inspect a plugin's registration
+
+#+begin_src python :results output
+# Read the __init__.py of the alexnet plugin
+from pathlib import Path
+import brainscore_vision
+
+init_file = (Path(brainscore_vision.__file__).parent
+             / 'models' / 'alexnet' / '__init__.py')
+print(init_file.read_text())
+#+end_src
+
+** Manually trigger plugin loading
+
+#+begin_src python :results output
+from brainscore_vision import model_registry, load_model
+
+# Before loading: 'alexnet' is NOT in the registry
+print(f"Before: 'alexnet' in registry = {'alexnet' in model_registry}")
+
+# Load triggers import_plugin + factory call
+model = load_model('alexnet')
+print(f"After:  'alexnet' in registry = {'alexnet' in model_registry}")
+print(f"Model type: {type(model).__name__}")
+print(f"Model identifier: {model.identifier}")
+#+end_src
+
+* Writing Your Own Plugin
+
+Here is a minimal model plugin skeleton:
+
+** Directory structure
+
+#+begin_example
+brainscore_vision/models/my_custom_model/
+    __init__.py
+    model.py
+    requirements.txt   (optional)
+    test.py            (recommended)
+#+end_example
+
+** =__init__.py= — registration
+
+#+begin_src python
+from brainscore_vision import model_registry
+from brainscore_vision.model_helpers.brain_transformation import ModelCommitment
+from .model import get_model, LAYERS
+
+model_registry['my_custom_model'] = lambda: ModelCommitment(
+    identifier='my_custom_model',
+    activations_model=get_model(),
+    layers=LAYERS)
+#+end_src
+
+** =model.py= — model construction
+
+#+begin_src python
+import torchvision.models
+from brainscore_vision.model_helpers.activations.pytorch import (
+    PytorchWrapper, load_preprocess_images)
+
+LAYERS = ['features.0', 'features.3', 'features.6', 'classifier.1', 'classifier.4']
+
+def get_model():
+    model = torchvision.models.vgg11(pretrained=True)
+    preprocessing = load_preprocess_images(image_size=224)
+    wrapper = PytorchWrapper(
+        model=model,
+        preprocessing=preprocessing,
+        identifier='my_custom_model')
+    return wrapper
+#+end_src
+
+** =test.py= — basic smoke test
+
+#+begin_src python
+import pytest
+from brainscore_vision import load_model
+
+@pytest.mark.private_access
+def test_model_loads():
+    model = load_model('my_custom_model')
+    assert model.identifier == 'my_custom_model'
+#+end_src
+
+* Design Analysis
+
+** Why text search instead of decorators?
+
+Decorators (=@register('alexnet')=) would require importing the module to
+discover it — defeating lazy loading. The text search on =__init__.py=
+discovers registrations /without/ importing any plugin code.
+
+** Why factories instead of instances?
+
+A factory =lambda: ModelCommitment(...)= defers construction until scoring
+time. This means:
+- Model weights are not downloaded at import time
+- Data assemblies are not loaded at import time
+- The registry can hold hundreds of entries with near-zero memory
+
+** Why a single =__init__.py= convention?
+
+Every plugin's registration must appear literally as
+=model_registry['identifier']= in =__init__.py=. This is fragile in theory
+(rename the registry variable and discovery breaks), but robust in practice
+(the convention is enforced by the community submission process).
+
+** Comparison to DMT's plugin system
+
+| Concern              | Brain-Score                       | DMT (Blue Brain)                    |
+|----------------------+-----------------------------------+-------------------------------------|
+| Discovery            | Text search in =__init__.py=        | Adapter Pattern via entry points    |
+| Registry             | Global dicts in =__init__.py=       | Contract-based adapter registry     |
+| Lazy loading         | Factory functions (lambdas)       | Lazy import + memoization           |
+| Dependency isolation | Per-plugin =requirements.txt=       | Per-adapter =setup.py= extras        |
+| Side-effect import   | =__import__()= populates registry   | Entry point loading populates pool  |
+| Extensibility        | Add directory + =__init__.py=       | Add adapter class + register        |
+
+The pattern is the same: *extensibility without core modification*. The
+mechanism differs (text search vs entry points), but the architectural intent
+is identical.
+
+* Summary
+
+| Concept                       | What it is                                           |
+|-------------------------------+------------------------------------------------------|
+| Registry                      | Plain =dict[str, Callable]= — identifier → factory    |
+| Plugin directory              | Subdirectory with =__init__.py= containing assignment  |
+| =locate_plugin()=              | Text search for registry assignment in =__init__.py=   |
+| =import_plugin()=              | Locate → install deps → =__import__()= → registry set |
+| =load_model()= / =load_benchmark()= | =import_plugin()= then call the factory               |
+| Factory pattern               | Deferred construction — nothing loaded until needed  |
+
+* Next
+
+- [[file:01-installation-and-first-score.org][Tutorial 01]]: Installation and first score
+- [[file:03-model-commitment.org][Tutorial 03]]: How PyTorch models become BrainModels (the Adapter Pattern)
+- [[file:04-benchmarks-metrics-ceilings.org][Tutorial 04]]: How benchmarks compose data, metrics, and ceilings
+- [[file:05-score-and-data-assembly.org][Tutorial 05]]: The Score and DataAssembly xarray conventions

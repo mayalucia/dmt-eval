@@ -1,0 +1,536 @@
+#+title: Brain-Score Tutorial 05 — Score, DataAssembly, and xarray Conventions
+#+author: Vishal Sood
+#+date: <2026-02-27 Fri>
+#+options: toc:t num:t
+
+* What This Tutorial Covers
+
+The data structures that flow through the entire Brain-Score pipeline:
+=DataAssembly= (the universal data currency), =NeuroidAssembly= and
+=BehavioralAssembly= (specialized variants), =StimulusSet= (metadata about
+stimuli), and =Score= (the final output). All are built on xarray, and
+understanding them is essential for working with Brain-Score at the code level.
+
+* xarray Primer
+
+If you know NumPy arrays, xarray adds /named dimensions/ and /coordinates/:
+
+#+begin_src python :results output
+import xarray as xr
+import numpy as np
+
+# A plain numpy array: shape (3, 4) — what do the axes mean?
+data = np.random.randn(3, 4)
+
+# An xarray DataArray: axes have names and labeled coordinates
+da = xr.DataArray(
+    data,
+    dims=['image', 'neuron'],
+    coords={
+        'image':  ['cat.png', 'dog.png', 'car.png'],
+        'neuron': ['n001', 'n002', 'n003', 'n004']
+    })
+
+print(da)
+print()
+print(f"Select by label: da.sel(image='cat.png')")
+print(da.sel(image='cat.png'))
+print()
+print(f"Select by index: da.isel(neuron=0)")
+print(da.isel(neuron=0))
+#+end_src
+
+Brain-Score extends =xarray.DataArray= with domain-specific conventions.
+
+* =DataAssembly=: The Universal Data Currency
+
+=DataAssembly= is a thin subclass of =xarray.DataArray=:
+
+#+begin_src python
+# brainscore_core/benchmarks/__init__.py (conceptual)
+
+class DataAssembly(xr.DataArray):
+    """Base class for all Brain-Score data structures.
+    Adds utilities for coordinate walking, merging, and multi-groupby."""
+    pass
+#+end_src
+
+Key utility functions for working with assemblies:
+
+#+begin_src python
+from brainio.assemblies import walk_coords, gather_indexes, merge_data_arrays
+
+# walk_coords: iterate over all coordinates with their dimensions
+for name, dims, values in walk_coords(assembly):
+    print(f"  {name} (dims={dims}): {len(values)} values")
+
+# gather_indexes: convert coords to MultiIndex (needed for netCDF I/O)
+assembly = gather_indexes(assembly)
+
+# merge_data_arrays: combine assemblies along shared dimensions
+merged = merge_data_arrays([assembly1, assembly2])
+#+end_src
+
+* =NeuroidAssembly=: Neural Recordings
+
+The standard format for neural data — both primate recordings and model
+activations:
+
+#+begin_src python :results output
+# Dimensions:
+#   presentation — one entry per stimulus presentation (image × repetition)
+#   neuroid      — one entry per recording site (neuron / model unit)
+#   time_bin     — optional, for temporal data
+
+# Standard coordinates on 'presentation':
+#   stimulus_id  — unique image identifier
+#   image_id     — image filename or path
+#   object_name  — e.g. 'bear', 'car', 'face'
+#   category     — e.g. 'animate', 'inanimate'
+#   repetition   — trial number
+#   ...
+
+# Standard coordinates on 'neuroid':
+#   neuroid_id   — unique unit identifier
+#   region       — brain region: 'V1', 'V2', 'V4', 'IT'
+#   animal       — e.g. 'monkey_M', 'monkey_P' (for primate data)
+#   layer        — model layer name (for model activations)
+#   neuroid_num  — integer index within the layer
+#   ...
+
+# Example shapes:
+# Primate IT:  (2560, 168)       — 256 images × 10 reps, 168 neurons
+# AlexNet IT:  (2560, 9216)      — 256 images × 10 reps, 256×6×6 units
+#+end_src
+
+Creating a =NeuroidAssembly=:
+
+#+begin_src python :results output
+from brainio.assemblies import NeuroidAssembly
+import numpy as np
+
+# Simulated model activations for 100 images, 512 units
+data = np.random.randn(100, 512)
+
+assembly = NeuroidAssembly(
+    data,
+    dims=['presentation', 'neuroid'],
+    coords={
+        'stimulus_id': ('presentation', [f'img_{i:03d}' for i in range(100)]),
+        'object_name': ('presentation', ['cat']*50 + ['dog']*50),
+        'neuroid_id':  ('neuroid', [f'unit_{i:03d}' for i in range(512)]),
+        'region':      ('neuroid', ['IT'] * 512),
+        'layer':       ('neuroid', ['features.11'] * 512),
+    })
+
+print(f"Shape: {assembly.shape}")
+print(f"Dims: {assembly.dims}")
+print(f"Regions: {np.unique(assembly['region'].values)}")
+print(f"Objects: {np.unique(assembly['object_name'].values)}")
+#+end_src
+
+* =BehavioralAssembly=: Behavioral Responses
+
+For behavioral benchmarks — classification labels, probabilities, etc.:
+
+#+begin_src python
+# Dimensions:
+#   presentation — one entry per stimulus
+#   choice       — optional, for probability vectors
+
+# Coordinates on 'presentation':
+#   stimulus_id, image_id, object_name, category, ...
+
+# Example: class probabilities
+# Shape: (100, 1000) — 100 images, 1000 ImageNet classes
+#+end_src
+
+* =StimulusSet=: Image Metadata
+
+A =StimulusSet= is a pandas =DataFrame= with image metadata, plus a method
+to retrieve the actual image files:
+
+#+begin_src python :results output
+# StimulusSet columns (typical):
+#   stimulus_id  — unique identifier
+#   image_id     — filename
+#   object_name  — what's in the image
+#   category     — semantic category
+#   image_label  — human-given label
+#   degrees      — visual angle
+#
+# The StimulusSet also carries a .get_stimulus(stimulus_id) method
+# that returns the path to the image file (downloaded from S3 if needed).
+#+end_src
+
+Accessing a benchmark's stimulus set:
+
+#+begin_src python :results output
+import brainscore_vision
+
+benchmark = brainscore_vision.load_benchmark(
+    'dicarlo.MajajHong2015public.IT-pls')
+
+stimulus_set = benchmark._assembly.stimulus_set
+
+print(f"Number of stimuli: {len(stimulus_set)}")
+print(f"Columns: {list(stimulus_set.columns)}")
+print()
+print("First 5 rows:")
+print(stimulus_set.head())
+#+end_src
+
+* =Score=: The Final Output
+
+=Score= is a =DataAssembly= with special semantics:
+
+#+begin_src python
+# brainscore_core/metrics/__init__.py
+
+class Score(DataAssembly):
+    """
+    Output of metrics, benchmarks, and ceilings.
+    - Scalar or array of score values
+    - 'aggregation' dimension with 'center' and 'error'
+    - 'raw' attribute containing pre-aggregation sub-scores
+    - 'ceiling' attribute (if ceiling-normalized)
+    """
+    RAW_VALUES_KEY = 'raw'
+#+end_src
+
+** Score structure
+
+#+begin_src python :results output
+import brainscore_vision
+
+score = brainscore_vision.score(
+    model_identifier='alexnet',
+    benchmark_identifier='dicarlo.MajajHong2015public.IT-pls')
+
+# The top-level score
+print(f"Score type: {type(score).__name__}")
+print(f"Score dims: {score.dims}")
+print(f"Score coords: {list(score.coords)}")
+print()
+
+# Center and error
+center = float(score.sel(aggregation='center'))
+error  = float(score.sel(aggregation='error'))
+print(f"Center: {center:.4f}")
+print(f"Error:  {error:.4f}")
+print()
+
+# The ceiling (attached as attribute)
+ceiling = score.ceiling
+print(f"Ceiling: {float(ceiling):.4f}")
+print()
+
+# The raw score (before ceiling normalization)
+if hasattr(score, 'raw'):
+    raw = score.raw
+    print(f"Raw score type: {type(raw).__name__}")
+    print(f"Raw center: {float(raw.sel(aggregation='center')):.4f}")
+#+end_src
+
+** The =aggregation= dimension
+
+Every =Score= has an =aggregation= coordinate with two values:
+- =center=: the point estimate (mean across neurons/splits)
+- =error=: the standard error (uncertainty estimate)
+
+#+begin_src python :results output
+# The aggregation dimension
+print(score.sel(aggregation='center'))  # The score value
+print(score.sel(aggregation='error'))   # The uncertainty
+
+# float() on a Score extracts the center value
+print(f"float(score) = {float(score):.4f}")
+# This is equivalent to:
+print(f"center = {float(score.sel(aggregation='center')):.4f}")
+#+end_src
+
+** Raw values: the sub-score chain
+
+The =raw= attribute stores the pre-aggregation scores. This can be nested:
+
+#+begin_src python :results output
+# Chain of raw values:
+# score                → ceiling-normalized score (0-1)
+# score.raw            → raw score before ceiling normalization
+# score.raw.raw        → per-neuron scores before averaging (maybe)
+
+if hasattr(score, 'raw'):
+    raw = score.raw
+    print(f"Raw shape: {raw.shape}")
+    print(f"Raw values (first 5): {raw.values[:5]}")
+
+    if hasattr(raw, 'raw'):
+        raw_raw = raw.raw
+        print(f"Raw-raw shape: {raw_raw.shape}")
+#+end_src
+
+** How =Score= preserves raw values through operations
+
+=Score= overrides xarray operations to propagate the =raw= attribute:
+
+#+begin_src python
+class Score(DataAssembly):
+    def sel(self, *args, _apply_raw=True, **kwargs):
+        """sel propagates to raw values by default."""
+        return self._preserve_raw('sel', *args, **kwargs, _apply_raw=_apply_raw)
+
+    def mean(self, *args, _apply_raw=False, **kwargs):
+        """mean does NOT propagate to raw values by default."""
+        return self._preserve_raw('mean', *args, **kwargs, _apply_raw=_apply_raw)
+
+    def _preserve_raw(self, func, *args, _apply_raw=False,
+                      _ignore_errors=True, **kwargs):
+        result = getattr(super(), func)(*args, **kwargs)
+        for attr_key, attr_value in self.attrs.items():
+            if self.RAW_VALUES_KEY in attr_key:
+                if _apply_raw:
+                    try:
+                        attr_value = getattr(attr_value, func)(*args, **kwargs)
+                    except Exception as e:
+                        if not _ignore_errors:
+                            raise e
+                result.attrs[attr_key] = attr_value
+        return result
+#+end_src
+
+The design choice: =sel= (subsetting) propagates to raw values, but =mean=
+(aggregation) does not. This is because subsetting preserves the meaning of
+raw values, while aggregation would lose the per-element structure.
+
+** Merging scores
+
+When multiple scores need to be combined (e.g., across brain regions):
+
+#+begin_src python
+# Score.merge combines assemblies AND their raw values
+combined = Score.merge(score_v4, score_it,
+                       exception_handling='ignore')
+
+# The merged score has raw values from both originals
+print(combined.raw)
+#+end_src
+
+* Data Flow Through the Pipeline
+
+#+begin_example
+StimulusSet (DataFrame)
+  │
+  │ model.look_at(stimulus_set)
+  ▼
+NeuroidAssembly (presentation × neuroid)
+  │    coords: stimulus_id, neuroid_id, region, layer, ...
+  │
+  │ metric(model_assembly, neural_assembly)
+  ▼
+Score (aggregation: center, error)
+  │    attrs: raw = per-neuron scores
+  │
+  │ explained_variance(score, ceiling)
+  ▼
+Score (aggregation: center, error)
+       attrs: raw = pre-normalized score
+              ceiling = data reliability
+#+end_example
+
+At each stage, the xarray structure carries both the data /and/ the metadata
+needed to interpret it. No separate metadata files, no loose coupling between
+data and its provenance.
+
+* BrainIO: Data Storage and Retrieval
+
+Neural assemblies and stimulus sets are stored and retrieved through BrainIO:
+
+#+begin_src python :results output
+# Loading a public data assembly
+from brainscore_vision import load_dataset
+
+assembly = load_dataset('dicarlo.MajajHong2015.public')
+print(f"Type: {type(assembly).__name__}")
+print(f"Shape: {assembly.shape}")
+print(f"Dims: {assembly.dims}")
+#+end_src
+
+BrainIO stores data in two formats:
+- *netCDF4* (=.nc=): for =DataAssembly= / =NeuroidAssembly= — xarray-native format
+- *CSV*: for =StimulusSet= metadata
+- *Images*: stored separately, referenced by paths in the =StimulusSet=
+
+Data is hosted on S3 and downloaded on first access. The =BRAINIO_HOME=
+environment variable controls the local cache location (default =~/.brainio=).
+
+* Hands-On: Working with Assemblies
+
+** Create and manipulate a NeuroidAssembly
+
+#+begin_src python :results output
+from brainio.assemblies import NeuroidAssembly
+import numpy as np
+
+# Create synthetic assembly: 50 images, 100 neurons, 2 brain regions
+np.random.seed(42)
+n_images = 50
+n_neurons_v4 = 60
+n_neurons_it = 40
+n_total = n_neurons_v4 + n_neurons_it
+
+data = np.random.randn(n_images, n_total)
+
+assembly = NeuroidAssembly(
+    data,
+    dims=['presentation', 'neuroid'],
+    coords={
+        'stimulus_id':  ('presentation', [f'stim_{i}' for i in range(n_images)]),
+        'object_name':  ('presentation', ['cat']*25 + ['dog']*25),
+        'neuroid_id':   ('neuroid', [f'n{i}' for i in range(n_total)]),
+        'region':       ('neuroid', ['V4']*n_neurons_v4 + ['IT']*n_neurons_it),
+    })
+
+print("Full assembly:")
+print(f"  Shape: {assembly.shape}")
+print(f"  Dims: {assembly.dims}")
+print()
+
+# Select by brain region
+it_assembly = assembly.sel(neuroid=assembly['region'] == 'IT')
+print(f"IT only: shape = {it_assembly.shape}")
+
+v4_assembly = assembly.sel(neuroid=assembly['region'] == 'V4')
+print(f"V4 only: shape = {v4_assembly.shape}")
+print()
+
+# Select by stimulus property
+cat_responses = assembly.sel(presentation=assembly['object_name'] == 'cat')
+print(f"Cat stimuli: shape = {cat_responses.shape}")
+print()
+
+# Mean response per object category
+for obj in ['cat', 'dog']:
+    subset = assembly.sel(presentation=assembly['object_name'] == obj)
+    mean_response = float(subset.mean())
+    print(f"Mean response to {obj}: {mean_response:.4f}")
+#+end_src
+
+** Create and inspect a Score
+
+#+begin_src python :results output
+from brainscore_core.metrics import Score
+import numpy as np
+
+# Simulate per-neuron scores
+neuron_scores = np.random.uniform(0.2, 0.8, size=100)
+
+# Aggregate into center ± error
+center = np.mean(neuron_scores)
+error = np.std(neuron_scores) / np.sqrt(len(neuron_scores))
+
+# Create the Score object
+score = Score(
+    [center, error],
+    dims=['aggregation'],
+    coords={'aggregation': ['center', 'error']})
+
+# Attach raw per-neuron values
+raw_score = Score(
+    neuron_scores,
+    dims=['neuroid'],
+    coords={'neuroid': range(len(neuron_scores))})
+score.attrs[Score.RAW_VALUES_KEY] = raw_score
+
+print(f"Score center: {float(score.sel(aggregation='center')):.4f}")
+print(f"Score error:  {float(score.sel(aggregation='error')):.4f}")
+print(f"Raw shape:    {score.raw.shape}")
+print(f"Raw mean:     {float(score.raw.mean()):.4f}")
+print(f"Raw std:      {float(score.raw.std()):.4f}")
+#+end_src
+
+** Ceiling normalization by hand
+
+#+begin_src python :results output
+from brainscore_core.metrics import Score
+import numpy as np
+
+# Raw score
+raw_center = 0.48
+raw_error = 0.007
+raw_score = Score(
+    [raw_center, raw_error],
+    dims=['aggregation'],
+    coords={'aggregation': ['center', 'error']})
+
+# Ceiling
+ceiling_center = 0.817
+ceiling_error = 0.005
+ceiling = Score(
+    [ceiling_center, ceiling_error],
+    dims=['aggregation'],
+    coords={'aggregation': ['center', 'error']})
+
+# Manual ceiling normalization (simple ratio)
+normalized_center = raw_center / ceiling_center
+print(f"Raw score:        {raw_center:.4f}")
+print(f"Ceiling:          {ceiling_center:.4f}")
+print(f"Normalized score: {normalized_center:.4f}")
+print(f"Interpretation:   model explains {normalized_center*100:.1f}%"
+      f" of explainable variance")
+#+end_src
+
+* The xarray Convention in Context
+
+Brain-Score's use of xarray mirrors a broader trend in scientific computing:
+labeled, self-describing data structures that carry metadata alongside values.
+
+| Concern                | Brain-Score (xarray)           | HDF5 (BBP/DMT)                   |
+|------------------------+--------------------------------+-----------------------------------|
+| Data structure         | =DataAssembly= (=xr.DataArray=)  | HDF5 groups + datasets            |
+| Named dimensions       | Built-in (dims)                | Convention (attribute names)      |
+| Coordinate labels      | Built-in (coords)              | Dimension scales                  |
+| Metadata               | =attrs= dict                    | HDF5 attributes                   |
+| Hierarchical           | Nested attrs (=raw=, =ceiling=)   | HDF5 group hierarchy              |
+| Serialization          | netCDF4                        | HDF5                              |
+| In-memory manipulation | xarray/pandas API              | h5py / numpy API                  |
+| Lazy loading           | Via dask (optional)            | Via h5py chunked reads            |
+
+The philosophical choice is the same: data should be self-describing. The
+technology differs (xarray/netCDF4 vs HDF5), but the pattern — labeled axes,
+attached metadata, hierarchical structure — is shared.
+
+* Summary
+
+| Concept              | What it is                                                    |
+|----------------------+---------------------------------------------------------------|
+| =DataAssembly=         | Base class: xarray DataArray with Brain-Score conventions     |
+| =NeuroidAssembly=      | Neural data: dims =(presentation, neuroid)=, coords for stimuli + neurons |
+| =BehavioralAssembly=   | Behavioral data: dims =(presentation,)= or =(presentation, choice)= |
+| =StimulusSet=          | Stimulus metadata: pandas DataFrame + image retrieval         |
+| =Score=                | Benchmark output: =aggregation= dim (center, error) + raw attrs |
+| =Score.raw=            | Pre-aggregation sub-scores, nested arbitrarily deep           |
+| =Score.ceiling=        | Data reliability estimate, attached as attribute              |
+| Coordinate convention | Every axis has semantic labels, not just integer indices      |
+| BrainIO              | Data storage: netCDF4 for assemblies, S3 for remote hosting  |
+
+* Series Summary
+
+This concludes the five-part tutorial series. Together they cover:
+
+1. [[file:01-installation-and-first-score.org][Tutorial 01]]: Installation, =brainscore_vision.score()=, first score, interpretation
+2. [[file:02-plugin-architecture.org][Tutorial 02]]: Plugin discovery, registries, lazy loading, dependency management
+3. [[file:03-model-commitment.org][Tutorial 03]]: =ModelCommitment=, =PytorchWrapper=, forward hooks, activation extraction
+4. [[file:04-benchmarks-metrics-ceilings.org][Tutorial 04]]: =NeuralBenchmark=, metrics, ceilings, ceiling normalization
+5. [[file:05-score-and-data-assembly.org][Tutorial 05]]: =Score=, =DataAssembly=, =NeuroidAssembly=, xarray conventions
+
+The central insight: Brain-Score is a *composition engine*. Models are composed
+with benchmarks via a standardized interface. Benchmarks are composed from data,
+metrics, and ceilings. Scores carry their provenance (raw values, ceiling) as
+nested attributes. And the whole system is extensible through a plugin registry
+that requires no modification to core code.
+
+For someone coming from DMT/Blue Brain, the engineering patterns are immediately
+recognizable: adapter-based model wrapping, composable validation tests, plugin
+registries, and self-describing scientific data structures. The domain vocabulary
+changes (biophysical → functional, NEURON → PyTorch, HDF5 → netCDF4), but the
+architecture is the same platform.

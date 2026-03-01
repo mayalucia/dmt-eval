@@ -1,0 +1,227 @@
+#+TITLE: WP-04 — Adapter Decorators: =@adapts= and =@implements=
+#+AUTHOR: Vishal Sood
+#+DATE: 2026-02
+#+PROPERTY: header-args :tangle ../adapter.py
+#+OPTIONS: toc:2 num:t H:3
+
+* Introduction
+
+The Adapter Pattern is central to both Brain-Score and DMT. In both systems, the
+core problem is the same: /a model written by a researcher doesn't conform to the
+platform's interface, so an adapter mediates between them/.
+
+In Brain-Score, this role is played by =ModelCommitment=: it takes a
+=PytorchWrapper= (which knows how to extract activations from a PyTorch model) and
+adapts it to the =BrainModel= interface (=look_at=, =start_recording=, etc.). The
+mapping from model layers to brain regions lives in =ModelCommitment=.
+
+In DMT, the Adapter Pattern was made explicit through two decorators:
+
+- =@adapts(ModelClass)= — marks a class as adapting a particular model type
+- =@implements(Interface)= — validates and registers the class as implementing
+  an interface
+
+This module provides both decorators. They're simpler than DMT's originals:
+
+- No =ABCMeta.register()= call (unnecessary for Brain-Score's use case — we use
+  structural, not nominal, conformance)
+- =@implements= validates /all/ missing methods (DMT's version only reported the
+  first)
+- Clean attribute initialization (no =try/except AttributeError= pattern)
+
+* Source
+
+#+begin_src python
+"""
+Adapter decorators: @adapts and @implements.
+
+DMT used two decorators to wire adapters:
+  @adapts(ModelClass)        — marks what model type this adapter handles
+  @implements(Interface)     — validates the adapter implements the interface
+
+Both are parametric class decorators that annotate the class and
+optionally register it in the interface's implementation registry.
+
+This version simplifies DMT's approach:
+- No ABCMeta.register() (unnecessary for Brain-Score's use case)
+- @implements validates ALL missing methods (DMT only reported the first)
+- Clean attribute initialization (no try/except AttributeError pattern)
+"""
+
+from __future__ import annotations
+
+from typing import Type
+
+from .interface import Interface
+
+
+def adapts(*model_classes: type):
+    """Mark an adapter class as adapting one or more model classes.
+
+    Usage::
+
+        @adapts(torch.nn.Module)
+        class PytorchAdapter:
+            ...
+
+    Or multiple models::
+
+        @adapts(AlexNet, ResNet)
+        class VisionModelAdapter:
+            ...
+
+    The decorated class gets ``__adapted_models__``: a dict mapping
+    class name → class.
+    """
+    def decorator(adapter_cls):
+        if not hasattr(adapter_cls, '__adapted_models__'):
+            adapter_cls.__adapted_models__ = {}
+        for model_class in model_classes:
+            adapter_cls.__adapted_models__[model_class.__name__] = model_class
+        return adapter_cls
+    return decorator
+
+
+def implements(interface_cls: Type[Interface], name: str = None):
+    """Validate and register a class as implementing an Interface.
+
+    Validates at decoration time that all required methods are present.
+    Raises TypeError immediately if any are missing — fail fast, not
+    at scoring time.
+
+    Usage::
+
+        @implements(BrainModelInterface)
+        class MyModel:
+            def look_at(self, stimuli): ...
+            def start_recording(self, target, time_bins): ...
+            ...
+
+    With explicit registration name::
+
+        @implements(BrainModelInterface, name='my_model')
+        class MyModel:
+            ...
+
+    The decorated class gets ``__implemented_interfaces__``: a dict
+    mapping interface name → interface class.
+    """
+    def decorator(impl_cls):
+        # Validate
+        missing = interface_cls.validate(impl_cls)
+        if missing:
+            guide = interface_cls.implementation_guide()
+            raise TypeError(
+                f"{impl_cls.__name__} does not implement "
+                f"{interface_cls.__name__}.\n"
+                f"Missing methods: {missing}\n\n"
+                f"{guide}"
+            )
+
+        # Annotate the class
+        if not hasattr(impl_cls, '__implemented_interfaces__'):
+            impl_cls.__implemented_interfaces__ = {}
+        impl_cls.__implemented_interfaces__[interface_cls.__name__] = interface_cls
+
+        # Register in the interface's registry
+        reg_name = name or impl_cls.__name__
+        interface_cls.register(reg_name, impl_cls)
+
+        return impl_cls
+    return decorator
+
+
+def get_adapted_models(adapter_cls) -> dict[str, type]:
+    """Return the models this adapter handles."""
+    return getattr(adapter_cls, '__adapted_models__', {})
+
+
+def get_implemented_interfaces(impl_cls) -> dict[str, Type[Interface]]:
+    """Return the interfaces this class implements."""
+    return getattr(impl_cls, '__implemented_interfaces__', {})
+#+end_src
+
+* Commentary
+
+** =@adapts=: Metadata Annotation
+
+=@adapts= is purely declarative. It doesn't validate anything — it just stamps
+the adapter class with =__adapted_models__=, a dict mapping class names to
+classes. This metadata can be queried at runtime to answer "what model types
+does this adapter handle?"
+
+In Brain-Score, =ModelCommitment= is the universal adapter — it adapts any
+=PytorchWrapper= to =BrainModel=. But if the platform grew to support non-PyTorch
+backends (JAX, TensorFlow), each backend adapter could declare what it adapts:
+
+#+begin_example python
+@adapts(torch.nn.Module)
+class PytorchModelCommitment:
+    ...
+
+@adapts(jax.Module)
+class JaxModelCommitment:
+    ...
+#+end_example
+
+The adapter dispatch logic could then use =get_adapted_models()= to choose the
+right adapter for a given model type.
+
+** =@implements=: Validation + Registration + Annotation
+
+=@implements= does three things at decoration time:
+
+1. *Validate*: check that the class has all required methods. If not, raise
+   =TypeError= with the full list of missing methods /and/ the implementation
+   guide (which methods, with docstrings, are expected).
+
+2. *Annotate*: stamp =__implemented_interfaces__= on the class, a dict mapping
+   interface name → interface class. Queryable at runtime.
+
+3. *Register*: add the class to the interface's =__implementation_registry__=
+   (via =interface_cls.register()=, which does its own validation — redundant
+   but safe).
+
+The error message on failure is designed to be actionable:
+
+#+begin_example
+MyModel does not implement BrainModelInterface.
+Missing methods: ['look_at', 'start_recording']
+
+To implement BrainModelInterface, provide these methods:
+  - identifier: Unique model name, e.g. 'alexnet'.
+  - look_at: Present stimuli, return NeuroidAssembly or BehavioralAssembly.
+  - start_recording: Configure the model to record from a brain region.
+  - start_task: Configure the model for a behavioral task.
+  - visual_degrees: How many visual degrees the model's input subtends.
+#+end_example
+
+This is a significant improvement over DMT's original, which reported only the
+first missing method and provided no guide.
+
+** =get_adapted_models()= and =get_implemented_interfaces()=
+
+Convenience functions for runtime introspection. They use =getattr= with a
+default empty dict, so they're safe to call on any class — not just decorated
+ones.
+
+** Why Parametric Decorators?
+
+Both =@adapts= and =@implements= are /parametric/ — they take arguments and
+return a decorator:
+
+#+begin_example python
+@implements(BrainModelInterface)     # implements(BrainModelInterface) returns decorator
+class MyModel:                       # decorator(MyModel) validates and annotates
+    ...
+#+end_example
+
+This is the standard Python pattern for decorators that need configuration. The
+alternative — a single decorator that inspects its argument type — would be
+less explicit and harder to compose.
+
+* Cross-References
+
+- [[file:01-interface.org][WP-01: Interface]] — =validate()= and =register()= called by =@implements=
+- [[file:02-brain-model.org][WP-02: Brain Model]] — the interfaces passed to =@implements=
+- [[file:05-plugin.org][WP-05: Plugin]] — =ModelPlugin= uses =__init_subclass__= instead of decorators
