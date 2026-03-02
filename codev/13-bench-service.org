@@ -1,0 +1,378 @@
+#+TITLE: WP-13 — bench.mayalucia.dev: DMT as a Live Service
+#+AUTHOR: Vishal Sood
+#+DATE: <2026-03-02 Sun>
+#+OPTIONS: toc:2 num:t H:3
+
+* Urgency and Context
+
+*Read this first.* This work package exists because of a concrete deadline.
+
+On *2026-03-03 at 15:00*, the human (mu2tau) meets his ORP employment
+counsellor. He has spent the weekend building DMT-Eval — a universal
+validation framework born from 7 years at Blue Brain Project, now targeting
+NeuroAI benchmarking (Brain-Score). The real audience is not the counsellor
+but the *NeuroAI research community* — specifically groups building neural
+digital twins (Mathis lab at EPFL, the Brain-Score team at MIT, Ganguli's
+group at Stanford).
+
+The ask: *a live service at =bench.mayalucia.dev= where a researcher can
+run DMT evaluations and see structured scientific reports.*
+
+The human will test and debug tomorrow morning. Your job tonight: *wire
+everything up*. Create the app, the deployment config, the website pages.
+Leave it ready to test. Do not deploy — the human will deploy from mahakali
+after testing locally.
+
+* What Already Works
+
+Before you write anything, understand what exists.
+
+** =dmt.evaluate()= — the engine
+
+Location: =src/dmt/evaluate.py=
+
+This is the Level-0 entry point. It takes:
+- a list of model objects (each has =.name= and =.predict(observations)=)
+- a DataFrame of observations
+- a =Scenario= descriptor (which columns are which)
+- optional reference model
+
+It produces a *LabReport* — a structured Markdown document with: Abstract,
+Introduction, Methods, Results (with tables), stratified Results by group,
+Discussion, Conclusion. It writes to a directory and returns the path.
+
+** Two working scenarios
+
+*** Weather (=src/dmt/scenario/weather.py=)
+- Synthetic AR(1) temperature data for 5 European cities (Zurich, Madrid,
+  Stockholm, Athens, London)
+- Three models: Persistence (tomorrow = today), Climatology (seasonal
+  average), NoisyRegression (AR(1) blend)
+- Scenario: stratified by city and season
+- *Runs in <1 second, no external dependencies*
+
+*** Drug Efficacy (=src/dmt/scenario/drug_efficacy.py=)
+- Synthetic Hill equation dose-response for 3 compounds
+- Three models: Linear, Sigmoid(miscalibrated), Calibrated
+- Scenario: stratified by compound and dose
+- *Runs in <1 second, no external dependencies*
+
+** Brain-Score domain adapter (=src/dmt/domains/brainscore/=)
+- 747 lines, 7 modules, zero external dependencies
+- =Interface= base, =PluginRegistry=, =@adapts= / =@implements= decorators
+- Compatibility bridge to Brain-Score's native registries
+- *Tests are broken* — they import =brain_score_dmt= (old package name)
+  instead of =dmt.domains.brainscore= (actual path). See §Fix below.
+
+** Brain-Score tutorial numbers (from codev/08-12)
+These are hard facts from the tutorials:
+- AlexNet on =dicarlo.MajajHong2015public.IT-pls=: raw r ≈ 0.48, ceiling = 0.817, normalized ≈ 0.588
+- AlexNet on =dicarlo.MajajHong2015public.V4-pls=: ceiling = 0.892
+- Available public benchmarks include IT-pls, V4-pls, Rajalingham2018, Geirhos2021, Hebart2023
+
+* What You Build
+
+** Part 1: The Streamlit App
+
+Create a directory =bench/= at the dmt-eval repo root.
+
+*** =bench/app.py= — the frontend (~200 lines)
+
+A Streamlit app with:
+
+1. *Sidebar*: domain selector (Weather / Drug Efficacy / Brain-Score)
+2. *Main area*: when user clicks "Evaluate":
+   - For Weather & Drug: call =dmt.evaluate()= live, render the LabReport
+   - For Brain-Score: display pre-cached results through the same report pipeline
+3. *Report display*: render the Markdown LabReport inline via =st.markdown()=
+4. *Code reveal*: expandable =st.expander("Show code")= blocks showing the
+   exact Python that produced the result
+5. *Download*: =st.download_button= for the report as =.md=
+
+The import structure:
+#+begin_src python
+import sys
+from pathlib import Path
+
+# Add dmt-eval src to path (when running locally)
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from dmt.evaluate import evaluate, WEATHER, DRUG_EFFICACY, Scenario
+from dmt.scenario.weather import (
+    generate_observations as weather_obs,
+    PersistenceModel, ClimatologyModel, NoisyRegressionModel,
+)
+from dmt.scenario.drug_efficacy import (
+    generate_observations as drug_obs,
+    LinearModel, SigmoidModel, CalibratedModel,
+)
+#+end_src
+
+For Brain-Score, create a =bench/brainscore_cache.py= that provides
+pre-computed DataFrames and a report-generation function using the same
+=render_markdown= pipeline.
+
+*** =bench/brainscore_cache.py= — pre-computed results (~80 lines)
+
+Hard-code the known scores from the tutorials into DataFrames:
+
+#+begin_src python
+import pandas as pd
+from collections import OrderedDict
+from dmt.document.renderer import render_markdown
+
+# From codev/08-brainscore-installation.org and codev/11-brainscore-benchmarks.org
+BRAINSCORE_RESULTS = pd.DataFrame([
+    {"model": "AlexNet", "benchmark": "MajajHong2015.IT-pls",
+     "raw_score": 0.48, "ceiling": 0.817, "normalized_score": 0.588},
+    {"model": "AlexNet", "benchmark": "MajajHong2015.V4-pls",
+     "raw_score": 0.55, "ceiling": 0.892, "normalized_score": 0.616},
+])
+
+def brainscore_report(output_dir="./dmt_report") -> str:
+    """Generate a LabReport from cached Brain-Score results."""
+    sections = OrderedDict()
+    sections["abstract"] = {
+        "name": "Abstract",
+        "narrative": (
+            "We evaluate neural network models against primate neural recordings "
+            "using the Brain-Score platform. Models are scored by comparing their "
+            "internal representations to neural population responses in macaque "
+            "visual cortex (V4, IT) using partial least squares regression, "
+            "normalized by the data's split-half reliability ceiling."
+        ),
+    }
+    sections["methods"] = {
+        "name": "Methods",
+        "narrative": (
+            "**Platform**: Brain-Score (brain-score.org)\n\n"
+            "**Metric**: PLS regression between model activations and neural "
+            "recordings, ceiling-normalized by explained variance.\n\n"
+            "**Data**: MajajHong2015 — 2560 presentations, 168 IT neurons, "
+            "88 V4 neurons. Public subset.\n\n"
+            "**Adapter**: DMT brain-score-dmt layer provides interface enforcement "
+            "at registration time via @implements decorator and validated "
+            "PluginRegistry."
+        ),
+    }
+    sections["results"] = {
+        "name": "Results",
+        "narrative": "### Brain-Score Evaluation Results",
+        "data": BRAINSCORE_RESULTS,
+    }
+    sections["discussion"] = {
+        "name": "Discussion",
+        "narrative": (
+            "AlexNet achieves moderate brain-similarity scores (IT: 0.588, "
+            "V4: 0.616 after ceiling normalization). These scores are consistent "
+            "with published Brain-Score leaderboard values. The DMT adapter layer "
+            "validates plugin compliance at registration time — before any "
+            "benchmark runs — eliminating the late-failure mode where a model "
+            "is discovered to lack required methods only at scoring time.\n\n"
+            "**Note**: These results are pre-computed from Brain-Score v2. "
+            "Live scoring requires GPU and the brainscore_vision package. "
+            "The DMT framework wrapping demonstrated here is domain-agnostic — "
+            "the same Scenario/evaluate/LabReport pattern applies to weather "
+            "prediction, drug efficacy, and any domain with models and reference data."
+        ),
+    }
+    report_path = render_markdown(
+        "Brain-Score Model Evaluation (DMT LabReport)", sections, output_dir
+    )
+    return report_path.read_text()
+#+end_src
+
+*** =bench/Dockerfile=
+
+#+begin_src dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dmt-eval + streamlit dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the dmt package
+COPY src/ /app/src/
+
+# Copy the bench app
+COPY bench/ /app/bench/
+
+ENV PYTHONPATH=/app/src
+EXPOSE 8501
+
+CMD ["streamlit", "run", "bench/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]
+#+end_src
+
+*** =bench/requirements.txt=
+
+#+begin_example
+streamlit>=1.35.0
+pandas>=2.0
+numpy>=1.24
+tabulate>=0.9
+jinja2>=3.0
+#+end_example
+
+** Part 2: Fix the =brain_score_dmt= Import Problem
+
+The tests and some source files import from =brain_score_dmt=. The actual
+package path is =dmt.domains.brainscore=. The =pyproject.toml= packages
+=src/dmt=, not =src/brain_score_dmt=.
+
+*** The shim approach (tonight)
+
+Create =test/conftest.py=:
+
+#+begin_src python :tangle ../../test/conftest.py
+"""Make brain_score_dmt importable as an alias for dmt.domains.brainscore.
+
+The literate sources (07-init.org) define brain_score_dmt as the public
+namespace, but pyproject.toml packages src/dmt. Until the org files are
+updated, this shim bridges the gap at test time.
+"""
+import importlib
+import sys
+
+import dmt.domains.brainscore as _bs
+
+# Register the package
+sys.modules["brain_score_dmt"] = _bs
+
+# Register submodules so 'from brain_score_dmt.interface import X' works
+_submodules = [
+    "interface", "brain_model", "registry", "adapter",
+    "plugin", "compat",
+]
+for name in _submodules:
+    full = f"dmt.domains.brainscore.{name}"
+    mod = importlib.import_module(full)
+    sys.modules[f"brain_score_dmt.{name}"] = mod
+
+# Register examples subpackage
+_examples = importlib.import_module("dmt.domains.brainscore.examples")
+sys.modules["brain_score_dmt.examples"] = _examples
+for name in ["alexnet", "benchmark"]:
+    full = f"dmt.domains.brainscore.examples.{name}"
+    mod = importlib.import_module(full)
+    sys.modules[f"brain_score_dmt.examples.{name}"] = mod
+#+end_src
+
+This makes every existing =from brain_score_dmt.X import Y= resolve
+correctly. The real fix (updating org sources) is a separate work package.
+
+** Part 3: Deployment Configuration
+
+*** Add to =deployment/docker-compose.yml=
+
+Add a =bench= service block following the =comptoir= pattern:
+
+#+begin_src yaml
+  bench:
+    build:
+      context: ./bench
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8501"
+#+end_src
+
+Note: the build context is =./bench= on the VPS, which means the
+=deploy.sh= must rsync both =bench/= and =src/= into that directory.
+
+*** Add to =deployment/Caddyfile=
+
+#+begin_example
+bench.mayalucia.dev {
+    reverse_proxy bench:8501
+}
+#+end_example
+
+*** Add =deploy_bench= to =deployment/deploy.sh=
+
+Follow the =deploy_comptoir= pattern: rsync from the dmt-eval repo to
+=$VPS_HOST:$VPS_DEPLOY_DIR/bench/=, then =docker compose up -d --build bench=.
+
+The rsync must include:
+- =modules/dmt-eval/bench/= → =bench/bench/=
+- =modules/dmt-eval/src/= → =bench/src/=
+- =modules/dmt-eval/bench/Dockerfile= → =bench/Dockerfile=
+- =modules/dmt-eval/bench/requirements.txt= → =bench/requirements.txt=
+
+** Part 4: Website Pages
+
+Create these Hugo content pages for =mayalucia.dev=:
+
+*** =website/content/modules/dmt-eval.md=
+A portfolio page presenting:
+- What DMT is (validation = structured argumentation)
+- The Brain-Score domain adapter (747 lines, 3 design fixes)
+- The BBP provenance (co-author eLife 2024)
+- Link to =bench.mayalucia.dev= as the live demo
+- The architecture diagram from =literate/00-overview.org=
+
+*** =website/content/papers/neuroai-validation.md=
+A longer piece synthesizing:
+- Digital twins: from biophysical (BBP) to functional (Ganguli, Brain-Score)
+- DMT as the validation methodology that bridges both
+- The Brain-Score tutorial series as evidence of platform mastery
+- The EU AI Act framing (from =dmt-for-ai-agents.org=)
+- What's next: DMT applied to the new generation of neural digital twins
+
+*** Hugo config edits
+- Add "NeuroAI" to the menu in =hugo.yaml= (weight 33, between Papers and Portal)
+- Update =content/modules/_index.md= to include dmt-eval in the modules table
+
+** Part 5: DNS (human task)
+
+The human must add an A record:
+#+begin_example
+bench.mayalucia.dev  →  46.225.191.36
+#+end_example
+
+This is done via the domain registrar, not by the agent.
+
+* Execution Order
+
+1. Create =test/conftest.py= (the import shim)
+2. Create =bench/= directory with =app.py=, =brainscore_cache.py=,
+   =Dockerfile=, =requirements.txt=
+3. Create website pages (=dmt-eval.md=, =neuroai-validation.md=)
+4. Edit deployment configs (=docker-compose.yml=, =Caddyfile=, =deploy.sh=)
+5. Edit =hugo.yaml= and =modules/_index.md=
+6. *Do not commit*. The human will review and commit.
+7. *Do not deploy*. The human will test locally first.
+
+Actually, *do commit and push*. The human needs the changes on mahakali.
+But do not deploy.
+
+* Testing Checklist (for the human tomorrow)
+
+- [ ] =cd modules/dmt-eval && uv run pytest test/brainscore/ -v= — tests pass with conftest shim
+- [ ] =cd modules/dmt-eval && uv run pytest test/ -v= — full suite passes
+- [ ] =cd modules/dmt-eval/bench && streamlit run app.py= — app starts, shows sidebar
+- [ ] Weather evaluation produces a LabReport with tables
+- [ ] Drug efficacy evaluation produces a LabReport with tables
+- [ ] Brain-Score tab shows pre-cached results in report format
+- [ ] =cd website && hugo= — site builds without errors
+- [ ] =bench.mayalucia.dev= DNS resolves (after A record is added)
+- [ ] =./deployment/deploy.sh hugo= — static pages deploy
+- [ ] =./deployment/deploy.sh bench= — streamlit app deploys
+
+* What This Proves
+
+To a NeuroAI researcher:
+- You understand Brain-Score's internals (5 tutorials, reverse-engineered the stack)
+- You identified and fixed real architectural weaknesses (text search → =__init_subclass__=,
+  no enforcement → =@implements=, shared registries → per-interface =PluginRegistry=)
+- You built a cross-domain validation framework that works for weather, pharma, *and* neuroscience
+- You have a live service, not just papers or code — DMT in action
+
+To yourself:
+- You built this in a weekend, with AI collaboration, at 50, ahead of younger colleagues
+- The framework is real and tested — not vaporware
+- You're ready for the next conversation with any NeuroAI group
