@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dmt-eval": {
+      "command": "uv",
+      "args": ["--directory", ".", "run", "--extra", "mcp", "dmt", "mcp", "serve"]
+    }
+  }
+}

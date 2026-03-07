@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["openai", "anthropic"]
+mcp = ["fastmcp>=2.0"]
 weather = ["xarray", "xskillscore"]
 dev = ["pytest>=8.0", "ruff"]
 

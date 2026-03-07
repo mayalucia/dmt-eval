@@ -242,5 +242,46 @@ def list_cmd(
         raise typer.Exit(code=1)
 
 
+# ── mcp ───────────────────────────────────────────────────────────────────────
+
+mcp_app = typer.Typer(help="MCP server for agent-accessible validation tools.")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    sse: Optional[int] = typer.Option(
+        None, "--sse",
+        help="Run SSE transport on this port (default: stdio).",
+    ),
+):
+    """Start the DMT MCP server."""
+    try:
+        from dmt.mcp_server import run_stdio, run_sse
+    except ImportError:
+        typer.echo(
+            "MCP dependencies not installed. "
+            "Install with: pip install dmt-eval[mcp]",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if sse is not None:
+        typer.echo(f"Starting DMT MCP server (SSE on port {sse})...")
+        run_sse(port=sse)
+    else:
+        run_stdio()
+
+
+@mcp_app.command("tools")
+def mcp_tools():
+    """List available MCP tools (for debugging)."""
+    typer.echo("DMT MCP Tools:")
+    typer.echo("  evaluate       — Evaluate models, produce LabReport")
+    typer.echo("  compare        — Compare models on a scenario")
+    typer.echo("  list_available — List scenarios, metrics, or models")
+    typer.echo("  read_report    — Read an existing report")
+
+
 if __name__ == "__main__":
     app()
