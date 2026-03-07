@@ -91,17 +91,51 @@ EQUITY_FORECAST = Scenario(
 
 # ── The evaluator ──────────────────────────────────────────────────────────
 
+def _is_numeric(arr: np.ndarray) -> bool:
+    """Check if an array contains numeric data."""
+    return np.issubdtype(arr.dtype, np.number)
+
+
+def _exact_match(observed: np.ndarray, predicted: np.ndarray) -> float:
+    """Fraction of exact matches (case-insensitive, stripped)."""
+    matches = sum(
+        str(o).strip().lower() == str(p).strip().lower()
+        for o, p in zip(observed, predicted)
+    )
+    return float(matches / len(observed)) if len(observed) > 0 else 0.0
+
+
+def _fuzzy_match(observed: np.ndarray, predicted: np.ndarray) -> float:
+    """Fraction of responses containing the expected answer."""
+    matches = sum(
+        str(o).strip().lower() in str(p).strip().lower()
+        for o, p in zip(observed, predicted)
+    )
+    return float(matches / len(observed)) if len(observed) > 0 else 0.0
+
+
 def _compute_metrics(merged: pd.DataFrame, obs_col: str, pred_col: str,
                      reference_rmse: float | None = None) -> dict:
-    """Compute RMSE, bias, skill score on a merged DataFrame."""
+    """Compute metrics on a merged DataFrame.
+
+    For numeric data: RMSE, bias, skill score.
+    For string data: exact_match, fuzzy_match.
+    """
     observed = merged[obs_col].values
     predicted = merged[pred_col].values
-    result = {
-        "rmse": _rmse(observed, predicted),
-        "bias": _bias(observed, predicted),
-    }
-    if reference_rmse is not None:
-        result["skill_score"] = _skill_score(result["rmse"], reference_rmse)
+
+    if _is_numeric(observed) and _is_numeric(predicted):
+        result = {
+            "rmse": _rmse(observed, predicted),
+            "bias": _bias(observed, predicted),
+        }
+        if reference_rmse is not None:
+            result["skill_score"] = _skill_score(result["rmse"], reference_rmse)
+    else:
+        result = {
+            "exact_match": _exact_match(observed, predicted),
+            "fuzzy_match": _fuzzy_match(observed, predicted),
+        }
     return result
 
 
@@ -118,6 +152,18 @@ def _compute_by_group(merged: pd.DataFrame, obs_col: str, pred_col: str,
     return pd.DataFrame(rows)
 
 
+def _resolve_models(models: list) -> list:
+    """Resolve any string model specs to model objects."""
+    resolved = []
+    for m in models:
+        if isinstance(m, str):
+            from dmt.models import resolve
+            resolved.append(resolve(m))
+        else:
+            resolved.append(m)
+    return resolved
+
+
 def evaluate(
     models: list,
     observations: pd.DataFrame,
@@ -130,8 +176,9 @@ def evaluate(
 
     Parameters
     ----------
-    models : list of model objects
-        Each must have .name (str) and .predict(observations) -> DataFrame.
+    models : list of model objects or strings
+        Each must have .name (str) and .predict(observations) -> DataFrame,
+        or be a string model spec (e.g. "echo", "anthropic/claude-haiku-4-5-20251001").
     observations : DataFrame
         Ground truth.
     scenario : Scenario
@@ -146,6 +193,11 @@ def evaluate(
 
     Returns the path to the generated report.
     """
+    models = _resolve_models(models)
+    if isinstance(reference_model, str):
+        from dmt.models import resolve
+        reference_model = resolve(reference_model)
+
     if scenario is None:
         scenario = WEATHER
 
@@ -157,8 +209,15 @@ def evaluate(
     reference = reference_model or models[0]
     ref_predictions = reference.predict(observations)
     ref_merged = observations.merge(ref_predictions, on=merge_on)
-    reference_rmse = _rmse(ref_merged[obs_col].values,
-                           ref_merged[pred_col].values)
+
+    # Detect whether this is a numeric or string-valued scenario
+    numeric = (_is_numeric(ref_merged[obs_col].values)
+               and _is_numeric(ref_merged[pred_col].values))
+
+    reference_rmse = None
+    if numeric:
+        reference_rmse = _rmse(ref_merged[obs_col].values,
+                               ref_merged[pred_col].values)
 
     # ── Run all models ──────────────────────────────────────────────────
     all_summary = []
@@ -179,7 +238,16 @@ def evaluate(
             by_g["model"] = model.name
             all_by_group[group_col].append(by_g)
 
-    summary_df = pd.DataFrame(all_summary)[["model", "rmse", "bias", "skill_score"]]
+    if numeric:
+        metric_cols = ["model", "rmse", "bias", "skill_score"]
+        primary_metric = "rmse"
+        best_is_min = True
+    else:
+        metric_cols = ["model", "exact_match", "fuzzy_match"]
+        primary_metric = "exact_match"
+        best_is_min = False
+
+    summary_df = pd.DataFrame(all_summary)[metric_cols]
     grouped_dfs = {
         col: pd.concat(frames, ignore_index=True)
         for col, frames in all_by_group.items()
@@ -189,14 +257,42 @@ def evaluate(
     sections = OrderedDict()
 
     n_entities = observations[entity_col].nunique()
+
+    if numeric:
+        metrics_description = (
+            f"Models are compared using RMSE, bias, and skill score "
+            f"(relative to {reference.name})."
+        )
+        methods_narrative = (
+            "**Metrics**:\n\n"
+            "- *RMSE*: Root mean square error.  Lower is better.\n"
+            "- *Bias*: Mean (predicted - observed).  Zero is unbiased.\n"
+            f"- *Skill Score*: 1 - RMSE_model / RMSE_{reference.name}.  "
+            "Positive means the model beats the reference.\n\n"
+            f"**Grouping**: Results are stratified by "
+            + ", ".join(scenario.group_by) + "."
+        )
+    else:
+        metrics_description = (
+            "Models are compared using exact match and fuzzy match accuracy."
+        )
+        methods_narrative = (
+            "**Metrics**:\n\n"
+            "- *Exact Match*: Fraction of responses matching expected "
+            "answer exactly (case-insensitive).  Higher is better.\n"
+            "- *Fuzzy Match*: Fraction of responses containing the "
+            "expected answer as a substring.  Higher is better.\n\n"
+            f"**Grouping**: Results are stratified by "
+            + ", ".join(scenario.group_by) + "."
+        )
+
     sections["abstract"] = {
         "name": "Abstract",
         "narrative": (
             f"We evaluate {len(models)} {scenario.domain_name} models against "
             f"{scenario.observation_description} for "
             f"{n_entities} {scenario.entity_description}.  "
-            f"Models are compared using RMSE, bias, and skill score "
-            f"(relative to {reference.name})."
+            f"{metrics_description}"
         ),
     }
 
@@ -211,15 +307,7 @@ def evaluate(
 
     sections["methods"] = {
         "name": "Methods",
-        "narrative": (
-            "**Metrics**:\n\n"
-            "- *RMSE*: Root mean square error.  Lower is better.\n"
-            "- *Bias*: Mean (predicted - observed).  Zero is unbiased.\n"
-            f"- *Skill Score*: 1 - RMSE_model / RMSE_{reference.name}.  "
-            "Positive means the model beats the reference.\n\n"
-            f"**Grouping**: Results are stratified by "
-            + ", ".join(scenario.group_by) + "."
-        ),
+        "narrative": methods_narrative,
     }
 
     sections["results"] = {
@@ -239,15 +327,25 @@ def evaluate(
         }
 
     # ── Discussion: find best model overall and per group ──────────────
-    best_overall = summary_df.loc[summary_df["rmse"].idxmin(), "model"]
+    if best_is_min:
+        best_idx = summary_df[primary_metric].idxmin()
+    else:
+        best_idx = summary_df[primary_metric].idxmax()
+    best_overall = summary_df.loc[best_idx, "model"]
+
+    qualifier = "lowest" if best_is_min else "highest"
     discussion_parts = [
-        f"**{best_overall}** achieves the lowest overall RMSE.\n",
+        f"**{best_overall}** achieves the {qualifier} overall "
+        f"{primary_metric}.\n",
     ]
     for group_col, gdf in grouped_dfs.items():
         for val in gdf[group_col].unique():
             subset = gdf[gdf[group_col] == val]
             if not subset.empty:
-                best = subset.loc[subset["rmse"].idxmin(), "model"]
+                if best_is_min:
+                    best = subset.loc[subset[primary_metric].idxmin(), "model"]
+                else:
+                    best = subset.loc[subset[primary_metric].idxmax(), "model"]
                 discussion_parts.append(
                     f"- *{group_col}={val}*: best is **{best}**")
 

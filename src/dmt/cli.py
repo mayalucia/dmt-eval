@@ -64,13 +64,34 @@ def _get_scenario(name: str):
         models = [LinearModel(), SigmoidModel(), CalibratedModel()]
         return DRUG_EFFICACY, obs, models
 
+    elif name == "equity_forecast":
+        from dmt.evaluate import EQUITY_FORECAST
+        from dmt.scenario.equity import (
+            generate_returns,
+            MeanModel,
+            MomentumModel,
+            VolatilityModel,
+        )
+        obs = generate_returns()
+        models = [MeanModel(), MomentumModel(), VolatilityModel()]
+        return EQUITY_FORECAST, obs, models
+
+    elif name == "llm_qa":
+        from dmt.scenario.llm_qa import LLM_QA, generate_dataset
+        from dmt.models.baselines import EchoModel, RandomModel, TemplateModel
+        obs = generate_dataset()
+        models = [EchoModel(), RandomModel(), TemplateModel()]
+        return LLM_QA, obs, models
+
     else:
         typer.echo(f"Unknown scenario: {name}", err=True)
-        typer.echo("Available scenarios: weather, drug_efficacy", err=True)
+        typer.echo(
+            f"Available scenarios: {', '.join(_KNOWN_SCENARIOS)}", err=True,
+        )
         raise typer.Exit(code=1)
 
 
-_KNOWN_SCENARIOS = ["weather", "drug_efficacy"]
+_KNOWN_SCENARIOS = ["weather", "drug_efficacy", "equity_forecast", "llm_qa"]
 
 
 # ── eval ──────────────────────────────────────────────────────────────────────
