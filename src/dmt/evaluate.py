@@ -77,6 +77,17 @@ DRUG_EFFICACY = Scenario(
     entity_description="pharmaceutical compounds",
 )
 
+EQUITY_FORECAST = Scenario(
+    observed_col="return",
+    predicted_col="predicted_return",
+    entity_col="ticker",
+    merge_on=["ticker", "date", "regime"],
+    group_by=["ticker", "regime"],
+    domain_name="equity return forecasting",
+    observation_description="synthetic daily equity returns (GARCH-t)",
+    entity_description="synthetic equities",
+)
+
 
 # ── The evaluator ──────────────────────────────────────────────────────────
 

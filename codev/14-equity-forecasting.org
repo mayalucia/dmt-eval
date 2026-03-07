@@ -1,0 +1,847 @@
+#+title: Lesson 14 — Equity Return Forecasting
+#+subtitle: Financial time series as a validation scenario — learning through construction
+#+author: DMT-Eval (Human + AI collaboration)
+#+property: header-args:python :mkdirp yes
+#+startup: showall
+
+* What This Lesson Teaches
+
+The weather scenario works because everyone understands temperature.  The drug
+efficacy scenario works because dose-response is intuitive.  For finance, the
+equivalent question is: /given a history of daily equity returns, can you predict
+tomorrow's return?/
+
+This is the simplest non-trivial problem in quantitative finance.  It is also,
+famously, one of the hardest.  The efficient market hypothesis (EMH) says you
+cannot — and any model that claims otherwise must survive rigorous statistical
+validation.  That is exactly what DMT does.
+
+This lesson is explicitly a *learning scaffold*.  Through building a synthetic
+financial world and evaluating forecasting models against it, we gain:
+
+- Intuition for GARCH processes and volatility dynamics
+- Understanding of /why/ return forecasting is hard
+- Familiarity with risk metrics: VaR, Sharpe ratio, maximum drawdown
+- A framework to extend with real data and more sophisticated models
+
+The Feynman imperative: what I cannot create, I do not understand.
+
+** What Gets Built
+
+| File                              | Role                                              |
+|-----------------------------------+---------------------------------------------------|
+| =src/dmt/scenario/equity.py=     | GARCH(1,1)-t synthetic generator + three baselines |
+| =src/dmt/metrics/finance.py=     | Finance-specific metrics                          |
+| =test/test_equity_scenario.py=   | Data properties, model protocol, end-to-end       |
+
+* The Stylised Facts of Financial Returns
+
+Before writing a single line of code, we need to understand what financial
+returns /look like/.  Decades of empirical research have established a set of
+"stylised facts" — statistical regularities that appear across markets,
+instruments, and time periods:
+
+1. *Returns are roughly uncorrelated.*  You cannot predict tomorrow's return from
+   today's.  This is the EMH in action: if returns were predictable, arbitrageurs
+   would trade the pattern away.
+
+2. *Volatility clusters.*  Large price moves (positive or negative) tend to
+   follow large moves.  Quiet days follow quiet days.  Mathematically: returns
+   are uncorrelated, but /squared returns/ are strongly autocorrelated.
+
+3. *Fat tails.*  Extreme returns occur far more frequently than a Gaussian model
+   predicts.  The 1987 crash, the 2008 financial crisis, the March 2020 COVID
+   drop — all are "impossible" under Gaussian assumptions.
+
+4. *Leverage effect.*  Negative returns tend to increase future volatility more
+   than positive returns of the same magnitude.  A stock dropping 5% raises
+   uncertainty more than a 5% gain.
+
+5. *Weak mean reversion at long horizons.*  Over years, extreme valuations tend
+   to revert — but over days or weeks, returns are essentially unpredictable.
+
+A good synthetic generator must reproduce facts 1-3 at minimum.  Our GARCH(1,1)
+model with Student-t innovations does exactly this.
+
+** The GARCH(1,1) Model
+
+GARCH (Generalised Autoregressive Conditional Heteroskedasticity) is the
+workhorse of financial volatility modelling.  The (1,1) variant has three
+parameters governing the conditional variance:
+
+\[
+\sigma^2_t = \omega + \alpha \, r^2_{t-1} + \beta \, \sigma^2_{t-1}
+\]
+
+where:
+- $\omega > 0$ is the base variance (unconditional floor)
+- $\alpha \geq 0$ is the ARCH coefficient (how much yesterday's shock matters)
+- $\beta \geq 0$ is the GARCH coefficient (how much yesterday's variance persists)
+- $\alpha + \beta < 1$ ensures stationarity
+
+The return is then:
+
+\[
+r_t = \mu + \sigma_t \cdot \varepsilon_t, \quad \varepsilon_t \sim t(\nu)
+\]
+
+where $t(\nu)$ is the Student-t distribution with $\nu$ degrees of freedom.  Using
+Student-t (instead of Gaussian) innovations gives us fat tails even /beyond/ what
+GARCH's time-varying variance provides.
+
+The unconditional variance is $\sigma^2_{\infty} = \omega / (1 - \alpha - \beta)$,
+and the persistence of volatility shocks is $\alpha + \beta$.  When this is close
+to 1, volatility shocks die slowly — the hallmark of real financial data.
+
+** Why These Parameters?
+
+For a statistical physicist, GARCH is a driven Ornstein-Uhlenbeck process for the
+log-variance, discretised.  The $\alpha$ term is the driving noise (external
+shocks propagate into variance); the $\beta$ term is the mean-reversion
+(variance decays toward $\omega/(1-\alpha-\beta)$).  The ratio
+$\alpha/(\alpha+\beta)$ determines how "reactive" volatility is to new
+information versus how much it relies on its own history.
+
+* Building the Synthetic World
+
+#+begin_src python :tangle ../src/dmt/scenario/equity.py
+"""Synthetic equity returns and baseline forecasting models.
+
+The ground truth is a GARCH(1,1) process with Student-t innovations,
+reproducing the stylised facts of real financial time series:
+uncorrelated returns, volatility clustering, and fat tails.
+
+Three models of increasing sophistication attempt to forecast returns.
+"""
+
+from dataclasses import dataclass
+import numpy as np
+import pandas as pd
+
+
+# ── Ticker parameters ────────────────────────────────────────────────────────
+
+TICKERS = {
+    "ALPHA": {
+        "mu": 0.0004,    # daily drift (~10% annual)
+        "omega": 1e-6,   # base variance
+        "alpha": 0.05,   # ARCH: shock impact
+        "beta": 0.90,    # GARCH: variance persistence
+        "nu": 7,         # Student-t degrees of freedom
+    },
+    "BETA": {
+        "mu": 0.0001,    # low drift (~2.5% annual)
+        "omega": 5e-6,   # higher base variance
+        "alpha": 0.10,   # more reactive to shocks
+        "beta": 0.85,    # high persistence
+        "nu": 6,         # heavier tails
+    },
+    "GAMMA": {
+        "mu": 0.0008,    # high drift (~20% annual) — but with regime switches
+        "omega": 2e-6,
+        "alpha": 0.07,
+        "beta": 0.88,
+        "nu": 8,         # lighter tails
+        "regime_switch": True,
+    },
+    "DELTA": {
+        "mu": 0.0002,    # modest drift
+        "omega": 3e-6,   # elevated base variance
+        "alpha": 0.12,   # very reactive
+        "beta": 0.83,    # moderate persistence
+        "nu": 4,         # very heavy tails — crisis-prone
+    },
+}
+
+
+def _garch_simulate(
+    mu: float,
+    omega: float,
+    alpha: float,
+    beta: float,
+    nu: float,
+    n: int,
+    rng: np.random.Generator,
+    regime_switch: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Simulate a GARCH(1,1) process with Student-t innovations.
+
+    Returns (returns, conditional_variances).
+    """
+    # Unconditional variance as starting point
+    sigma2_uncond = omega / (1 - alpha - beta)
+    sigma2 = np.empty(n)
+    returns = np.empty(n)
+
+    sigma2[0] = sigma2_uncond
+    eps = rng.standard_t(df=nu, size=n)
+
+    # For regime-switching ticker: flip drift sign mid-series
+    mu_t = np.full(n, mu)
+    if regime_switch:
+        # Bear regime in middle third
+        third = n // 3
+        mu_t[third:2 * third] = -abs(mu) * 0.5
+
+    returns[0] = mu_t[0] + np.sqrt(sigma2[0]) * eps[0]
+
+    for t in range(1, n):
+        sigma2[t] = omega + alpha * returns[t - 1] ** 2 + beta * sigma2[t - 1]
+        returns[t] = mu_t[t] + np.sqrt(sigma2[t]) * eps[t]
+
+    return returns, sigma2
+
+
+def _assign_regimes(
+    cumulative_returns: np.ndarray,
+    conditional_variance: np.ndarray,
+) -> np.ndarray:
+    """Label each day as bull, bear, or crisis.
+
+    - crisis: conditional volatility > 2x median
+    - bear: cumulative return declining (20-day rolling negative)
+    - bull: everything else
+    """
+    n = len(cumulative_returns)
+    regimes = np.full(n, "bull", dtype=object)
+
+    vol = np.sqrt(conditional_variance)
+    median_vol = np.median(vol)
+
+    # Rolling 20-day return
+    window = min(20, n)
+    for t in range(window, n):
+        rolling_ret = cumulative_returns[t] - cumulative_returns[t - window]
+        if vol[t] > 2 * median_vol:
+            regimes[t] = "crisis"
+        elif rolling_ret < 0:
+            regimes[t] = "bear"
+
+    return regimes
+
+
+def generate_returns(
+    tickers: dict | None = None,
+    n_days: int = 1000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Generate synthetic daily equity returns.
+
+    Uses a GARCH(1,1) process with Student-t innovations for each ticker.
+    Returns a DataFrame with columns:
+        ticker, date, return, log_return, cumulative_return, regime
+    """
+    rng = np.random.default_rng(seed)
+    tickers = tickers or TICKERS
+    rows = []
+
+    for ticker, params in tickers.items():
+        returns, sigma2 = _garch_simulate(
+            mu=params["mu"],
+            omega=params["omega"],
+            alpha=params["alpha"],
+            beta=params["beta"],
+            nu=params["nu"],
+            n=n_days,
+            rng=rng,
+            regime_switch=params.get("regime_switch", False),
+        )
+
+        cumulative = np.cumsum(returns)
+        regimes = _assign_regimes(cumulative, sigma2)
+
+        for d in range(n_days):
+            rows.append({
+                "ticker": ticker,
+                "date": d,
+                "return": float(returns[d]),
+                "log_return": float(returns[d]),  # for small returns, approx equal
+                "cumulative_return": float(cumulative[d]),
+                "regime": regimes[d],
+            })
+
+    return pd.DataFrame(rows)
+#+end_src
+
+The =log_return= column is identical to =return= here because our generator
+produces log-returns directly (the GARCH process models $r_t = \log(P_t/P_{t-1})$).
+For real data, you would compute both arithmetic and log returns separately.
+
+* The Baseline Models
+
+Every validation needs baselines — models that are so simple their behaviour is
+transparent.  If a sophisticated model cannot beat these, it has no business
+existing.
+
+** MeanModel: The Efficient Market Baseline
+
+The expanding-window historical mean.  If the EMH holds (returns are
+unpredictable), this is the optimal forecast: your best guess for tomorrow is
+the long-run average.
+
+#+begin_src python :tangle ../src/dmt/scenario/equity.py
+
+# ── Baseline Models ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class MeanModel:
+    """Predict tomorrow's return as the expanding-window historical mean.
+
+    The efficient market baseline: if returns are unpredictable,
+    the best forecast is the long-run average.
+    """
+    name: str = "HistoricalMean"
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        predictions = []
+        for ticker in observations["ticker"].unique():
+            tk = observations[observations["ticker"] == ticker].sort_values("date")
+            returns = tk["return"].values
+            for i, row in enumerate(tk.itertuples()):
+                if i == 0:
+                    pred = 0.0  # no history yet
+                else:
+                    pred = float(np.mean(returns[:i]))
+                predictions.append({
+                    "ticker": ticker,
+                    "date": row.date,
+                    "predicted_return": pred,
+                    "regime": row.regime,
+                })
+        return pd.DataFrame(predictions)
+#+end_src
+
+** MomentumModel: The Trend Follower
+
+An exponentially weighted moving average (EWMA) of recent returns.  This
+captures the empirical observation that short-term trends sometimes persist —
+momentum is one of the few well-documented "anomalies" in finance.
+
+The EWMA with span $s$ gives weight $(1-\lambda)$ to the most recent
+observation, where $\lambda = 1 - 2/(s+1)$:
+
+\[
+\hat{r}_t = \lambda \hat{r}_{t-1} + (1-\lambda) r_t
+\]
+
+#+begin_src python :tangle ../src/dmt/scenario/equity.py
+
+
+@dataclass
+class MomentumModel:
+    """Predict using exponentially weighted moving average of recent returns.
+
+    Captures short-term trend persistence (momentum effect).
+    """
+    name: str = "Momentum"
+    span: int = 20  # EWMA span in days
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        decay = 2.0 / (self.span + 1)  # EWMA decay factor
+        predictions = []
+        for ticker in observations["ticker"].unique():
+            tk = observations[observations["ticker"] == ticker].sort_values("date")
+            returns = tk["return"].values
+            ewma = 0.0
+            for i, row in enumerate(tk.itertuples()):
+                predictions.append({
+                    "ticker": ticker,
+                    "date": row.date,
+                    "predicted_return": float(ewma),
+                    "regime": row.regime,
+                })
+                ewma = decay * returns[i] + (1 - decay) * ewma
+        return pd.DataFrame(predictions)
+#+end_src
+
+** VolatilityModel: Exploiting Volatility Clustering
+
+This model exploits the strongest stylised fact: volatility clusters.  The
+strategy: when realised volatility exceeds its moving average, predict mean
+reversion (returns will shrink); when volatility is low, predict drift
+continuation.
+
+The intuition is that high-volatility regimes are often associated with
+negative returns (the leverage effect), while low-volatility regimes tend to
+be trending markets.
+
+#+begin_src python :tangle ../src/dmt/scenario/equity.py
+
+
+@dataclass
+class VolatilityModel:
+    """Predict return direction using a volatility regime signal.
+
+    When realised vol > moving average vol: predict mean reversion.
+    When realised vol < moving average vol: predict drift continuation.
+    """
+    name: str = "VolRegime"
+    vol_window: int = 20    # realised vol window
+    drift_window: int = 60  # drift estimation window
+
+    def predict(self, observations: pd.DataFrame) -> pd.DataFrame:
+        predictions = []
+        for ticker in observations["ticker"].unique():
+            tk = observations[observations["ticker"] == ticker].sort_values("date")
+            returns = tk["return"].values
+            n = len(returns)
+            for i, row in enumerate(tk.itertuples()):
+                if i < self.drift_window:
+                    pred = 0.0  # not enough history
+                else:
+                    recent_vol = float(np.std(returns[i - self.vol_window:i]))
+                    longer_vol = float(np.std(returns[i - self.drift_window:i]))
+                    drift = float(np.mean(returns[i - self.drift_window:i]))
+
+                    if recent_vol > longer_vol:
+                        # High vol regime: predict mean reversion (toward zero)
+                        pred = drift * 0.3
+                    else:
+                        # Low vol regime: predict drift continuation
+                        pred = drift * 1.2
+
+                predictions.append({
+                    "ticker": ticker,
+                    "date": row.date,
+                    "predicted_return": pred,
+                    "regime": row.regime,
+                })
+        return pd.DataFrame(predictions)
+#+end_src
+
+* Finance-Specific Metrics
+
+The core DMT evaluator computes RMSE, bias, and skill score — universal metrics
+that work across any domain.  But finance has its own vocabulary of model quality:
+
+- *Directional accuracy*: did you call the sign right?  In trading, being right
+  about direction matters more than magnitude.
+- *Sharpe ratio*: risk-adjusted return.  A model that predicts well on average
+  but with wild variance is dangerous.
+- *Maximum drawdown*: the worst peak-to-trough decline.  Risk managers care about
+  the worst case, not the average case.
+- *Value-at-Risk (VaR)*: the loss that is exceeded only 5% of the time.  A
+  cornerstone of Basel III/IV regulatory capital requirements.
+
+#+begin_src python :tangle ../src/dmt/metrics/finance.py
+"""Finance-specific evaluation metrics.
+
+These complement DMT's core RMSE/bias/skill_score with metrics
+standard in quantitative finance and risk management.
+"""
+
+import numpy as np
+import pandas as pd
+
+
+def rmse(observed: np.ndarray, predicted: np.ndarray) -> float:
+    """Root mean square error of return forecasts."""
+    return float(np.sqrt(np.mean((observed - predicted) ** 2)))
+
+
+def directional_accuracy(observed: np.ndarray, predicted: np.ndarray) -> float:
+    """Fraction of days where the predicted direction matches actual.
+
+    Direction = sign of return.  Days where the actual return is exactly
+    zero are excluded (no direction to predict).
+    """
+    nonzero = observed != 0
+    if not np.any(nonzero):
+        return 0.0
+    return float(np.mean(np.sign(observed[nonzero]) == np.sign(predicted[nonzero])))
+
+
+def sharpe_ratio(returns: np.ndarray, annual_factor: float = 252.0) -> float:
+    """Annualised Sharpe ratio (assuming zero risk-free rate).
+
+    SR = mean(r) / std(r) * sqrt(252)
+    """
+    if len(returns) < 2:
+        return 0.0
+    std = float(np.std(returns, ddof=1))
+    if std == 0:
+        return 0.0
+    return float(np.mean(returns) / std * np.sqrt(annual_factor))
+
+
+def max_drawdown(returns: np.ndarray) -> float:
+    """Maximum peak-to-trough decline in cumulative returns.
+
+    Returns a non-negative number (the magnitude of the worst drawdown).
+    """
+    cumulative = np.cumsum(returns)
+    running_max = np.maximum.accumulate(cumulative)
+    drawdowns = running_max - cumulative
+    return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+
+def var_95(returns: np.ndarray) -> float:
+    """Value-at-Risk at the 95% confidence level.
+
+    Returns the 5th percentile of the return distribution (a negative
+    number for typical return series).  Interpretation: on 95% of days,
+    the loss does not exceed this magnitude.
+    """
+    if len(returns) == 0:
+        return 0.0
+    return float(np.percentile(returns, 5))
+
+
+def compute_finance_metrics(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+) -> dict[str, float]:
+    """Compute all finance metrics for a single model's predictions.
+
+    Parameters
+    ----------
+    observed : array of actual returns
+    predicted : array of predicted returns
+
+    Returns dict with: rmse, directional_accuracy, sharpe_ratio,
+    max_drawdown, var_95 (computed on forecast errors).
+    """
+    errors = observed - predicted
+    return {
+        "rmse": rmse(observed, predicted),
+        "directional_accuracy": directional_accuracy(observed, predicted),
+        "sharpe_observed": sharpe_ratio(observed),
+        "max_drawdown_observed": max_drawdown(observed),
+        "var_95_observed": var_95(observed),
+        "sharpe_predicted": sharpe_ratio(predicted),
+    }
+#+end_src
+
+* The Scenario Descriptor
+
+The scenario descriptor tells DMT's generic evaluator which columns are which.
+This is added to =evaluate.py= alongside =WEATHER= and =DRUG_EFFICACY=.
+
+The merge keys are =(ticker, date)=.  Stratification is by =ticker= and =regime=
+— so the LabReport will show whether a model performs differently in bull versus
+bear versus crisis periods.
+
+#+begin_example
+EQUITY_FORECAST = Scenario(
+    observed_col="return",
+    predicted_col="predicted_return",
+    entity_col="ticker",
+    merge_on=["ticker", "date", "regime"],
+    group_by=["ticker", "regime"],
+    domain_name="equity return forecasting",
+    observation_description="synthetic daily equity returns (GARCH-t)",
+    entity_description="synthetic equities",
+)
+#+end_example
+
+(This is not tangled — it is added manually to =src/dmt/evaluate.py=.)
+
+* Tests
+
+The tests verify three things: the synthetic data has the right statistical
+properties, the models satisfy DMT's protocol, and the full pipeline produces a
+report.
+
+#+begin_src python :tangle ../test/test_equity_scenario.py
+"""Tests for the equity forecasting scenario.
+
+Three categories:
+1. Synthetic data properties (fat tails, vol clustering)
+2. Model protocol compliance
+3. End-to-end pipeline (evaluate -> report)
+"""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from dmt.scenario.equity import (
+    generate_returns,
+    MeanModel,
+    MomentumModel,
+    VolatilityModel,
+    TICKERS,
+)
+from dmt.metrics.finance import (
+    directional_accuracy,
+    sharpe_ratio,
+    max_drawdown,
+    var_95,
+    compute_finance_metrics,
+)
+from dmt.evaluate import evaluate, EQUITY_FORECAST
+
+
+# ── Synthetic Data Properties ────────────────────────────────────────────────
+
+
+class TestSyntheticData:
+    """Verify the generated returns exhibit stylised facts."""
+
+    @pytest.fixture
+    def observations(self):
+        return generate_returns()
+
+    def test_shape(self, observations):
+        """4 tickers x 1000 days = 4000 rows."""
+        assert len(observations) == 4 * 1000
+        assert set(observations.columns) == {
+            "ticker", "date", "return", "log_return",
+            "cumulative_return", "regime",
+        }
+
+    def test_tickers_present(self, observations):
+        assert set(observations["ticker"].unique()) == set(TICKERS.keys())
+
+    def test_fat_tails(self, observations):
+        """Excess kurtosis should be > 0 (heavier than Gaussian)."""
+        for ticker in observations["ticker"].unique():
+            returns = observations[observations["ticker"] == ticker]["return"].values
+            n = len(returns)
+            mean = np.mean(returns)
+            m2 = np.mean((returns - mean) ** 2)
+            m4 = np.mean((returns - mean) ** 4)
+            kurtosis = m4 / (m2 ** 2) if m2 > 0 else 0
+            # Gaussian kurtosis = 3; excess kurtosis > 0 means fat tails
+            assert kurtosis > 3, (
+                f"{ticker}: kurtosis {kurtosis:.2f} should exceed 3 (Gaussian)"
+            )
+
+    def test_volatility_clustering(self, observations):
+        """Squared returns should be autocorrelated (lag-1 > 0)."""
+        for ticker in observations["ticker"].unique():
+            returns = observations[observations["ticker"] == ticker]["return"].values
+            sq = returns ** 2
+            # Lag-1 autocorrelation of squared returns
+            acf1 = np.corrcoef(sq[:-1], sq[1:])[0, 1]
+            assert acf1 > 0.0, (
+                f"{ticker}: squared-return autocorrelation {acf1:.3f} "
+                f"should be positive (volatility clustering)"
+            )
+
+    def test_returns_roughly_uncorrelated(self, observations):
+        """Raw returns should have weak autocorrelation."""
+        for ticker in observations["ticker"].unique():
+            returns = observations[observations["ticker"] == ticker]["return"].values
+            acf1 = np.corrcoef(returns[:-1], returns[1:])[0, 1]
+            # Not a hard statistical test — just a sanity check
+            assert abs(acf1) < 0.15, (
+                f"{ticker}: return autocorrelation {acf1:.3f} is too large"
+            )
+
+    def test_regimes_present(self, observations):
+        """Each ticker should have at least bull regime."""
+        for ticker in observations["ticker"].unique():
+            regimes = observations[observations["ticker"] == ticker]["regime"].unique()
+            assert "bull" in regimes
+
+
+# ── Model Protocol ───────────────────────────────────────────────────────────
+
+
+class TestModelProtocol:
+    """Every model must have .name and .predict() -> DataFrame."""
+
+    @pytest.fixture
+    def observations(self):
+        return generate_returns(n_days=100)
+
+    @pytest.fixture(params=[MeanModel, MomentumModel, VolatilityModel])
+    def model(self, request):
+        return request.param()
+
+    def test_has_name(self, model):
+        assert isinstance(model.name, str)
+        assert len(model.name) > 0
+
+    def test_predict_returns_dataframe(self, model, observations):
+        result = model.predict(observations)
+        assert isinstance(result, pd.DataFrame)
+
+    def test_predict_has_required_columns(self, model, observations):
+        result = model.predict(observations)
+        required = {"ticker", "date", "predicted_return", "regime"}
+        assert required.issubset(set(result.columns)), (
+            f"Missing columns: {required - set(result.columns)}"
+        )
+
+    def test_predict_same_length(self, model, observations):
+        result = model.predict(observations)
+        assert len(result) == len(observations)
+
+
+# ── Finance Metrics ──────────────────────────────────────────────────────────
+
+
+class TestFinanceMetrics:
+    """Verify metric functions on known inputs."""
+
+    def test_directional_accuracy_perfect(self):
+        obs = np.array([1.0, -1.0, 1.0, -1.0])
+        pred = np.array([0.5, -0.3, 2.0, -0.1])
+        assert directional_accuracy(obs, pred) == 1.0
+
+    def test_directional_accuracy_zero(self):
+        obs = np.array([1.0, -1.0, 1.0, -1.0])
+        pred = np.array([-0.5, 0.3, -2.0, 0.1])
+        assert directional_accuracy(obs, pred) == 0.0
+
+    def test_directional_accuracy_half(self):
+        obs = np.array([1.0, -1.0, 1.0, -1.0])
+        pred = np.array([0.5, 0.3, -2.0, -0.1])  # match on 0,3; mismatch on 1,2
+        assert directional_accuracy(obs, pred) == 0.5
+
+    def test_sharpe_ratio_positive(self):
+        # Constant positive returns => infinite Sharpe? No, std > 0 in practice
+        returns = np.array([0.01, 0.02, 0.01, 0.03, 0.01])
+        sr = sharpe_ratio(returns)
+        assert sr > 0
+
+    def test_sharpe_ratio_zero_returns(self):
+        returns = np.zeros(10)
+        assert sharpe_ratio(returns) == 0.0
+
+    def test_max_drawdown_no_loss(self):
+        # Monotonically increasing cumulative returns => no drawdown
+        returns = np.array([0.01, 0.01, 0.01, 0.01])
+        assert max_drawdown(returns) == 0.0
+
+    def test_max_drawdown_known(self):
+        # Up 3, then down 5 => drawdown of 5
+        returns = np.array([1.0, 1.0, 1.0, -2.0, -2.0, -1.0])
+        dd = max_drawdown(returns)
+        assert dd == pytest.approx(5.0)
+
+    def test_var_95_gaussian(self):
+        rng = np.random.default_rng(42)
+        returns = rng.normal(0, 1, size=10000)
+        v = var_95(returns)
+        # 5th percentile of N(0,1) is about -1.645
+        assert -2.0 < v < -1.3
+
+
+# ── End-to-End Pipeline ──────────────────────────────────────────────────────
+
+
+class TestEndToEnd:
+    """Full pipeline: generate -> models -> evaluate -> report."""
+
+    def test_evaluate_produces_report(self, tmp_path):
+        obs = generate_returns(n_days=200)
+
+        models = [MeanModel(), MomentumModel(), VolatilityModel()]
+
+        report_path = evaluate(
+            models=models,
+            observations=obs,
+            scenario=EQUITY_FORECAST,
+            output_dir=tmp_path / "equity_report",
+            title="Equity Return Forecast Comparison",
+        )
+
+        assert report_path.exists()
+        report = report_path.read_text()
+
+        # Standard sections
+        assert "# Equity Return Forecast Comparison" in report
+        assert "## Abstract" in report
+        assert "## Introduction" in report
+        assert "## Methods" in report
+        assert "## Results" in report
+        assert "## Discussion" in report
+        assert "## Conclusion" in report
+
+        # All models mentioned
+        assert "HistoricalMean" in report
+        assert "Momentum" in report
+        assert "VolRegime" in report
+
+    def test_stratified_csvs(self, tmp_path):
+        obs = generate_returns(n_days=200)
+        models = [MeanModel(), MomentumModel(), VolatilityModel()]
+
+        output_dir = tmp_path / "equity_report"
+        evaluate(
+            models=models,
+            observations=obs,
+            scenario=EQUITY_FORECAST,
+            output_dir=output_dir,
+            title="Equity Report",
+        )
+
+        assert (output_dir / "results.csv").exists()
+        assert (output_dir / "results_by_ticker.csv").exists()
+        assert (output_dir / "results_by_regime.csv").exists()
+
+    def test_finance_metrics_on_scenario(self):
+        """Compute finance metrics alongside standard evaluation."""
+        obs = generate_returns(n_days=500)
+        model = MeanModel()
+        predictions = model.predict(obs)
+
+        merged = obs.merge(predictions, on=["ticker", "date", "regime"])
+        for ticker in obs["ticker"].unique():
+            tk = merged[merged["ticker"] == ticker]
+            metrics = compute_finance_metrics(
+                tk["return"].values,
+                tk["predicted_return"].values,
+            )
+            assert "rmse" in metrics
+            assert "directional_accuracy" in metrics
+            assert 0 <= metrics["directional_accuracy"] <= 1
+            assert metrics["rmse"] >= 0
+#+end_src
+
+* Running It
+
+#+begin_example
+cd ~/path/to/dmt-eval
+make tangle
+uv run pytest test/test_equity_scenario.py -v
+
+# Quick sanity check: generate data and look at it
+uv run python -c "
+from dmt.scenario.equity import generate_returns
+obs = generate_returns()
+print(obs.groupby('ticker')['return'].describe())
+print()
+print('Regimes:', obs.groupby(['ticker', 'regime']).size())
+"
+#+end_example
+
+* What We Learned
+
+Building this scenario teaches several things:
+
+1. *GARCH is the simplest model that reproduces volatility clustering.*  It is to
+   financial volatility what AR(1) is to weather noise — the minimal
+   autoregressive model that captures the dominant time-series feature.
+
+2. *Return forecasting is hard by design.*  The EMH is not a law of physics, but
+   it is a strong prior.  Our HistoricalMean model (the EMH baseline) is
+   surprisingly hard to beat in RMSE.
+
+3. *Directional accuracy and RMSE measure different things.*  A model can have
+   poor RMSE but good directional accuracy (it gets the sign right but not the
+   magnitude), or vice versa.  Which matters more depends on your use case:
+   trading cares about direction; risk management cares about magnitude.
+
+4. *Regime stratification reveals hidden model behaviour.*  A model might perform
+   well overall but fail catastrophically in crisis regimes — exactly when you
+   need it most.  This is why DMT's stratified evaluation is valuable.
+
+5. *Synthetic data lets you control the ground truth.*  With real data, you never
+   know the true data-generating process.  With synthetic GARCH data, you know
+   exactly what the process is, which lets you test whether your models and
+   metrics are behaving correctly.
+
+* Downstream
+
+This WP establishes the pattern.  Natural extensions:
+
+- *Real data*: =yfinance= adapter for S&P 500 constituents
+- *More models*: ARIMA, GARCH-based forecasts, simple ML (random forest on lagged features)
+- *SR 11-7 report template*: formal model risk management structure
+- *Portfolio extension*: from single-stock to portfolio risk (correlation, diversification)
+- *Options pricing*: Black-Scholes as a DMT scenario — a natural next step for a physicist
