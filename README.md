@@ -41,6 +41,28 @@ pip install dmt-eval[llm]       # + OpenAI, Anthropic adapters
 pip install dmt-eval[weather]   # + xarray, weather metrics
 ```
 
+## CLI
+
+After installation, the `dmt` command is available:
+
+```bash
+# Evaluate all built-in weather models
+dmt eval --scenario weather
+
+# Evaluate drug efficacy models with custom output
+dmt eval --scenario drug_efficacy --output ./results
+
+# Compare specific models with a reference baseline
+dmt compare --scenario weather --models Persistence,Climatology --reference Climatology
+
+# Re-render an existing report
+dmt report ./dmt_report --format md
+
+# List available scenarios and metrics
+dmt list scenarios
+dmt list metrics
+```
+
 ## Status
 
 Pre-alpha. Architecture proven over 7 years at EPFL Blue Brain Project
