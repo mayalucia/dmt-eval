@@ -1,0 +1,7 @@
+# Claude Code substrate binding for dmt-eval-guardian
+provider: anthropic
+model: tbd                           # assigned at first instantiation
+cli_tool: claude-code
+context_window: 200000
+system_prompt: CLAUDE.md
+tools: [claude-code]

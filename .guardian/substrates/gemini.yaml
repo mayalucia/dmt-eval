@@ -1,0 +1,7 @@
+# Gemini CLI substrate binding for dmt-eval-guardian
+provider: google
+model: gemini-2.5-pro
+cli_tool: gemini-cli
+context_window: 1000000
+system_prompt: GEMINI.md
+tools: [gemini-cli]
