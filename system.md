@@ -133,7 +133,7 @@ within the MāyāLucIA organisation. Its guardian spirit is `dmt-eval-guardian`
 The module is a git submodule at `modules/dmt-eval` in the parent repo.
 
 **Sūtra relay**: The organisational relay is `github.com/mayalucia/sutra`.
-Clone locally to `.sutra/` (gitignored) if absent. Use the relay-read
+Clone locally to `.sutra/` (gitignored) if absent. Use the relay-protocol
 skill to fetch and filter messages. The local HEAD in `.sutra/` is your
 read cursor.
 
