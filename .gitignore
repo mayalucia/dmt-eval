@@ -31,5 +31,8 @@ tournament_output/
 # Sūtra relay clone (per-project harness, local cursor)
 .sutra/
 
+# Lab — local computational artefacts (regenerable from code)
+.lab/
+
 # OS
 .DS_Store
